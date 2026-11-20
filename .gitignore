@@ -1,0 +1,44 @@
+# ── Generated clips & temp files ─────────────────────────────────────────
+clips/
+tmp/
+
+# ── Logs ──────────────────────────────────────────────────────────────────
+*.log
+
+# ── Python ────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+*.whl
+.eggs/
+
+# ── Virtual environment ───────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── ffmpeg binaries (auto-downloaded, not tracked) ───────────────────────
+ffmpeg/
+
+# ── OS / editor ───────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ── Secrets / keys ────────────────────────────────────────────────────────
+.env
+*.key
+*.pem
+secrets.py
