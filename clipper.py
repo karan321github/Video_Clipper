@@ -15,6 +15,7 @@ Options
   --channel    twitch channel name (required for Twitch)
   --model      faster-whisper model: tiny|base|small|medium (overrides config)
   --threshold  chat spike multiplier override (float, default from config)
+  --vod-threshold  VOD audio spike threshold in dB above its baseline
   --max-clips  maximum number of clips to generate from a VOD (default: 20)
   --debug      enable DEBUG logging
 
@@ -147,6 +148,15 @@ def _parse_args() -> argparse.Namespace:
         default=20,
         dest="max_clips",
         help="Maximum number of clips to generate from a VOD (default: 20).",
+    )
+    parser.add_argument(
+        "--vod-threshold",
+        type=float,
+        default=None,
+        help=(
+            "VOD audio-spike threshold in dB above its rolling baseline "
+            f"(default: {config.VOD_LOUDNESS_SPIKE_DB})."
+        ),
     )
     parser.add_argument(
         "--debug",
@@ -458,16 +468,19 @@ def _run_vod(args: argparse.Namespace, info: VideoInfo) -> int:
     clip_maker = ClipMaker(provider, chat_reader)  # type: ignore[arg-type]
 
     # Detect spikes in the VOD
-    base_wall = provider.latest_segment().wall_start - info.duration if provider.latest_segment() else time.time() - (info.duration or 3600)
+    base_wall = provider.video_start_time
     vod_detector = VODHypeDetector()
     spikes = vod_detector.find_spikes(
         video_path=video_path,
         base_wall_time=base_wall,
         max_clips=args.max_clips,
+        threshold_db=args.vod_threshold,
     )
 
     if not spikes:
-        log.warning("No hype spikes found. Try lowering --threshold or checking the video.")
+        log.warning(
+            "No hype spikes found. Check the audio track or lower --vod-threshold."
+        )
         provider.cleanup()
         return 0
 

@@ -185,6 +185,7 @@ class OfflineSegmentProvider:
         self._duration = duration
         self._segments: list[SegmentInfo] = []
         self._lock     = threading.Lock()
+        self.video_start_time = 0.0
 
     def prepare(self) -> bool:
         """
@@ -228,22 +229,29 @@ class OfflineSegmentProvider:
             log.error("No .ts segments produced.")
             return False
 
-        # Build SegmentInfo list with synthetic wall_start values
+        # Build SegmentInfo list with wall times aligned to the actual VOD
         base_time = time.time() - self._duration
+        timeline_offset = 0.0
         with self._lock:
-            for f in ts_files:
-                try:
-                    idx = int(f.stem.rsplit("_", 1)[1])
-                except (IndexError, ValueError):
+            self.video_start_time = base_time
+            for idx, f in enumerate(ts_files):
+                segment_duration = _probe_duration(f)
+                if segment_duration <= 0:
+                    segment_duration = min(
+                        float(config.SEGMENT_DURATION),
+                        max(0.0, self._duration - timeline_offset),
+                    )
+                if segment_duration <= 0:
                     continue
-                wall_start = base_time + idx * config.SEGMENT_DURATION
+                wall_start = base_time + timeline_offset
                 seg = SegmentInfo(
                     path=f,
                     index=idx,
                     wall_start=wall_start,
-                    duration=float(config.SEGMENT_DURATION),
+                    duration=segment_duration,
                 )
                 self._segments.append(seg)
+                timeline_offset += segment_duration
 
         log.info("Prepared %d virtual segments from VOD.", len(self._segments))
         return bool(self._segments)
@@ -263,6 +271,28 @@ class OfflineSegmentProvider:
             if total >= seconds:
                 break
         return result
+
+    def get_segments_for_window(
+        self, spike_time: float, clip_duration: float
+    ) -> list[SegmentInfo]:
+        """Return source segments covering the clip window around a VOD spike."""
+        with self._lock:
+            segments = list(self._segments)
+        if not segments:
+            return []
+
+        video_start = segments[0].wall_start
+        video_end = segments[-1].wall_end
+        if video_end - video_start < clip_duration:
+            return segments
+
+        clip_start = spike_time - config.CLIP_LOOKBACK
+        clip_start = max(video_start, min(clip_start, video_end - clip_duration))
+        clip_end = clip_start + clip_duration
+        return [
+            seg for seg in segments
+            if seg.wall_end > clip_start and seg.wall_start < clip_end
+        ]
 
     def latest_segment(self) -> Optional[SegmentInfo]:
         with self._lock:
@@ -305,81 +335,131 @@ class VODHypeDetector:
         video_path: Path,
         base_wall_time: float,
         max_clips: int = 20,
+        threshold_db: float | None = None,
     ) -> list[float]:
         """
         Analyse the VOD for loud audio segments.
         Returns a list of absolute wall-clock spike times.
         """
+        if max_clips <= 0:
+            log.warning("VOD max_clips must be greater than zero.")
+            return []
+
         duration = _probe_duration(video_path)
         if duration <= 0:
             log.warning("Could not determine video duration; using whole video.")
             duration = 3600.0
+        if duration < config.CLIP_DURATION:
+            log.warning(
+                "VOD is only %.1f s; cannot create a %d-second clip.",
+                duration,
+                config.CLIP_DURATION,
+            )
+            return []
 
         log.info("Analysing %.0f-second VOD for hype moments…", duration)
 
-        # Sample one loudness reading per ANALYSIS_INTERVAL seconds
-        interval   = config.ANALYSIS_INTERVAL
-        window_rms: list[float] = []
-        spikes: list[float]     = []
-        last_spike_offset       = -config.CLIP_COOLDOWN_SECONDS
-
+        interval = config.ANALYSIS_INTERVAL
+        threshold = (
+            config.VOD_LOUDNESS_SPIKE_DB
+            if threshold_db is None
+            else threshold_db
+        )
+        samples: list[tuple[float, float]] = []
         t = 0.0
         while t < duration:
             rms = self._measure_loudness_at(video_path, t, interval)
-            window_rms.append(rms)
-
-            if len(window_rms) > config.ROLLING_WINDOW_SIZE:
-                avg = sum(window_rms[-config.ROLLING_WINDOW_SIZE:]) / config.ROLLING_WINDOW_SIZE
-                if (
-                    rms > -90.0
-                    and avg > -90.0
-                    and rms >= avg + config.LOUDNESS_SPIKE_DB
-                    and (t - last_spike_offset) >= config.CLIP_COOLDOWN_SECONDS
-                ):
-                    spike_wall = base_wall_time + t
-                    spikes.append(spike_wall)
-                    last_spike_offset = t
-                    log.info(
-                        "VOD spike at %.0fs (rms=%.1f dB, avg=%.1f dB)",
-                        t, rms, avg,
-                    )
-                    if len(spikes) >= max_clips:
-                        break
-
+            samples.append((t, rms))
             t += interval
 
-        log.info("Found %d spike(s) in VOD.", len(spikes))
-        return spikes
+        valid = [(offset, rms) for offset, rms in samples if rms > -90.0]
+        if not valid:
+            log.error("No usable audio readings in VOD; cannot identify clip moments.")
+            return []
+
+        candidates: list[tuple[float, float]] = []
+        for i, (offset, rms) in enumerate(samples):
+            baseline_values = [
+                value for _, value in samples[max(0, i - config.ROLLING_WINDOW_SIZE):i]
+                if value > -90.0
+            ]
+            if (
+                rms > -90.0
+                and len(baseline_values) >= max(1, config.ROLLING_WINDOW_SIZE // 2)
+                and rms >= sum(baseline_values) / len(baseline_values) + threshold
+            ):
+                candidates.append((offset, rms))
+
+        if not candidates and valid:
+            log.warning(
+                "No VOD windows exceeded the %.1f dB threshold; selecting the loudest windows instead.",
+                threshold,
+            )
+            candidates = valid
+
+        # A cooldown shorter than a clip would produce overlapping outputs.
+        clip_spacing = max(config.CLIP_COOLDOWN_SECONDS, config.CLIP_DURATION)
+        selected: list[tuple[float, float]] = []
+        for candidate in sorted(candidates, key=lambda sample: sample[1], reverse=True):
+            if all(
+                abs(candidate[0] - chosen[0]) >= clip_spacing
+                for chosen in selected
+            ):
+                selected.append(candidate)
+                if len(selected) >= max_clips:
+                    break
+
+        selected.sort(key=lambda sample: sample[0])
+        spike_times = [base_wall_time + offset for offset, _ in selected]
+        for offset, rms in selected:
+            log.info("VOD spike at %.0fs (rms=%.1f dB)", offset, rms)
+        log.info(
+            "VOD loudness scan: %d/%d usable windows; threshold=%.1f dB.",
+            len(valid),
+            len(samples),
+            threshold,
+        )
+        log.info("Found %d spike(s) in VOD.", len(spike_times))
+        return spike_times
 
     def _measure_loudness_at(
         self, path: Path, offset: float, duration: float
     ) -> float:
         """Measure RMS loudness of a [offset, offset+duration] window."""
         cmd = [
-            config.FFPROBE_BIN,
-            "-v", "error",
+            config.FFMPEG_BIN,
+            "-hide_banner",
+            "-nostats",
             "-ss", f"{offset:.1f}",
-            "-t",  f"{duration:.1f}",
-            "-f", "lavfi",
-            "-i", f"amovie={path.as_posix()},astats=metadata=1:reset=1",
-            "-show_entries", "frame_tags=lavfi.astats.Overall.RMS_level",
-            "-of", "csv=p=0",
+            "-t", f"{duration:.1f}",
+            "-i", str(path),
+            "-vn",
+            "-af", "volumedetect",
+            "-f", "null",
+            "-",
         ]
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
-            if r.returncode == 0 and r.stdout.strip():
-                vals = []
-                for line in r.stdout.strip().splitlines():
-                    try:
-                        v = float(line)
-                        if v > -200:
-                            vals.append(v)
-                    except ValueError:
-                        pass
-                if vals:
-                    return sum(vals) / len(vals)
-        except Exception:
-            pass
+            if r.returncode == 0:
+                match = re.search(
+                    r"mean_volume:\s*(-?(?:\d+(?:\.\d+)?|inf))\s*dB",
+                    r.stderr,
+                    re.IGNORECASE,
+                )
+                if match:
+                    value = float(match.group(1))
+                    return value if value > -200 else -99.0
+                log.warning("ffmpeg returned no mean-volume reading at %.1f s.", offset)
+            else:
+                log.warning(
+                    "ffmpeg loudness measurement failed at %.1f s: %s",
+                    offset,
+                    r.stderr[-500:].strip(),
+                )
+        except subprocess.TimeoutExpired:
+            log.warning("ffmpeg loudness measurement timed out at %.1f s.", offset)
+        except FileNotFoundError:
+            log.error("ffmpeg not found while measuring VOD loudness.")
         return -99.0
 
 
@@ -392,15 +472,18 @@ def download_video(url: str, out_dir: Path, video_id: str) -> Optional[Path]:
     Download a YouTube video using yt-dlp.
 
     Returns the path to the downloaded file, or None on failure.
-    Skips the download if a file with the expected ID already exists.
+    Reuses a cached file only if it contains a video stream.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Check if already downloaded (avoid re-downloading)
+    # Check if already downloaded (avoid re-downloading), but ignore audio-only
+    # leftovers from interrupted or older download attempts.
     for existing in out_dir.glob(f"*{video_id}*"):
         if existing.suffix in (".mp4", ".mkv", ".webm"):
-            log.info("Using already-downloaded file: %s", existing)
-            return existing
+            if _has_video_stream(existing):
+                log.info("Using already-downloaded file: %s", existing)
+                return existing
+            log.warning("Ignoring cached file without video: %s", existing)
 
     out_tmpl = str(out_dir / "%(id)s.%(ext)s")
     cmd = [
@@ -429,6 +512,9 @@ def download_video(url: str, out_dir: Path, video_id: str) -> Optional[Path]:
     # Locate the downloaded file
     for f in out_dir.glob(f"{video_id}.*"):
         if f.suffix in (".mp4", ".mkv", ".webm"):
+            if not _has_video_stream(f):
+                log.error("Downloaded media has no video stream: %s", f)
+                continue
             log.info("Downloaded: %s (%.1f MB)", f.name, f.stat().st_size / 1e6)
             return f
 
@@ -456,6 +542,30 @@ def _probe_duration(video_path: Path) -> float:
     except Exception:
         pass
     return 0.0
+
+
+def _has_video_stream(video_path: Path) -> bool:
+    """Return whether a local media file contains a video stream."""
+    cmd = [
+        config.FFPROBE_BIN,
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=codec_type",
+        "-of", "csv=p=0",
+        str(video_path),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+    except FileNotFoundError:
+        log.error("ffprobe not found while validating downloaded video.")
+        return False
+    except subprocess.TimeoutExpired:
+        log.error("Timed out checking for a video stream in %s.", video_path)
+        return False
+    if result.returncode != 0:
+        log.warning("Could not inspect media streams in %s: %s", video_path, result.stderr.strip())
+        return False
+    return bool(result.stdout.strip())
 
 
 # ---------------------------------------------------------------------------

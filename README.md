@@ -2,7 +2,7 @@
 
 **Free, local, zero-API-key live stream auto-clipper.**
 
-Watches any YouTube or Twitch live stream, detects hype moments from a chat spike or an audio loudness spike, and automatically generates vertical 9:16 short clips with burned-in captions and a chat-derived title — all while the stream is live.
+Watches YouTube or Twitch live streams and can process regular or archived YouTube videos. It detects chat or audio spikes and generates horizontal 16:9 clips with burned-in captions and a title.
 
 ---
 
@@ -20,13 +20,13 @@ ffmpeg writes rolling 30-second .ts segments → tmp/
    ├──► Chat reader (YouTube JSONL / Twitch IRC) → message deque
    │
    └──► Every 10 s: HypeDetector checks both signals
-              • Chat: messages/window > rolling_avg × 2.0 AND ≥ 5 msgs
+              • Chat: messages/window > rolling_avg × 3.0 AND ≥ 15 msgs
               • Audio: RMS dBFS > rolling_avg + 5 dB
               • Either signal spikes? → fire ClipMaker
                     │
                     ▼
-              Extract 30 s from 20 s before spike
-              Crop to 1080×1920 (9:16 vertical)
+              Extract 240 s from 20 s before spike
+              Render to 1920×1080 (16:9 horizontal)
               faster-whisper → SRT captions
               Chat n-gram → title overlay
               → clips/clip_<timestamp>_<title>.mp4
@@ -69,6 +69,11 @@ The first time you run a clip, faster-whisper will download the Whisper `base` m
 python clipper.py https://www.youtube.com/watch?v=LIVE_VIDEO_ID
 ```
 
+### Regular or archived YouTube video
+```bash
+python clipper.py https://youtu.be/VIDEO_ID --max-clips 5
+```
+
 ### Twitch stream
 ```bash
 python clipper.py https://www.twitch.tv/xqc --platform twitch --channel xqc
@@ -82,7 +87,9 @@ Options:
   --platform   youtube | twitch     (auto-detected from URL if omitted)
   --channel    <name>               Twitch channel name (required for Twitch)
   --model      tiny|base|small|medium|large-v2   Whisper model (default: base)
-  --threshold  <float>              Chat spike multiplier (default: 2.0)
+  --threshold  <float>              Chat spike multiplier (default: 3.0)
+  --max-clips  <int>                Maximum VOD clips (default: 20)
+  --vod-threshold <float>           VOD audio threshold in dB (default: 3.0)
   --debug                           Enable verbose debug logging
 ```
 
@@ -93,6 +100,9 @@ python clipper.py https://www.youtube.com/watch?v=LIVE_ID --model small
 
 # More sensitive chat spike detection
 python clipper.py https://www.twitch.tv/shroud --platform twitch --channel shroud --threshold 1.5
+
+# Process a published video with a lower audio-spike threshold
+python clipper.py https://youtu.be/VIDEO_ID --max-clips 5 --vod-threshold 2.5
 
 # Debug mode
 python clipper.py https://www.youtube.com/watch?v=LIVE_ID --debug
@@ -106,12 +116,14 @@ python clipper.py https://www.youtube.com/watch?v=LIVE_ID --debug
 |---------|---------|-------------|
 | `SEGMENT_DURATION` | `30` | Seconds per .ts segment |
 | `ANALYSIS_INTERVAL` | `10` | Seconds between hype checks |
-| `CLIP_DURATION` | `30` | Output clip length (seconds) |
+| `CLIP_DURATION` | `240` | Output clip length (seconds) |
 | `CLIP_LOOKBACK` | `20` | Seconds before spike where clip starts |
-| `CHAT_SPIKE_MULTIPLIER` | `2.0` | Chat must be this × its avg to spike |
-| `CHAT_SPIKE_MIN_MESSAGES` | `5` | Minimum absolute messages to count as spike |
+| `CHAT_SPIKE_MULTIPLIER` | `3.0` | Chat must be this × its avg to spike |
+| `CHAT_SPIKE_MIN_MESSAGES` | `15` | Minimum absolute messages to count as spike |
 | `LOUDNESS_SPIKE_DB` | `5.0` | dB above rolling avg to count as loud |
-| `CLIP_COOLDOWN_SECONDS` | `60` | Minimum gap between clips |
+| `VOD_LOUDNESS_SPIKE_DB` | `3.0` | VOD audio threshold above rolling baseline |
+| `CLIP_COOLDOWN_SECONDS` | `45` | Minimum gap between live spike detections |
+| `OUTPUT_WIDTH` × `OUTPUT_HEIGHT` | `1920×1080` | Horizontal 16:9 output resolution |
 | `WHISPER_MODEL` | `"base"` | Whisper model size |
 | `WHISPER_DEVICE` | `"cpu"` | `"cpu"` or `"cuda"` (NVIDIA GPU) |
 

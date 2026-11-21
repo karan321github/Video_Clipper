@@ -50,6 +50,7 @@ CHAT_SPIKE_MIN_MESSAGES: int = 15   # Minimum 15 messages in 10s window to count
 # Audio: RMS loudness must exceed rolling_avg_rms + this many dB.
 # Chat is optional: an audio spike alone can trigger a clip.
 LOUDNESS_SPIKE_DB: float = 5.0
+VOD_LOUDNESS_SPIKE_DB: float = 3.0  # lower relative threshold for prerecorded audio
 # How many analysis windows to average for the rolling baseline
 ROLLING_WINDOW_SIZE: int = 6        # 6 × 10 s = 60 s baseline
 

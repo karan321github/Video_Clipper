@@ -6,9 +6,10 @@ from unittest.mock import Mock, patch, MagicMock
 
 import chat_reader
 import config
+from clip_maker import ClipMaker
 from chat_reader import YouTubeChatReader
 from hype_detector import HypeDetector
-from recorder import StreamRecorder
+from recorder import SegmentInfo, StreamRecorder
 from video_processor import (
     normalize_youtube_url,
     probe_video,
@@ -16,6 +17,7 @@ from video_processor import (
     NullChatReader,
     OfflineSegmentProvider,
     VODHypeDetector,
+    _has_video_stream,
 )
 
 
@@ -279,6 +281,133 @@ class OfflineSegmentProviderTests(unittest.TestCase):
             segs = provider.get_segments_covering(60.0)
             total = sum(s.duration for s in segs)
             self.assertGreaterEqual(total, 60.0)
+
+    def test_get_segments_for_window_selects_spike_region(self):
+        provider = OfflineSegmentProvider(Path("video.mp4"), 600.0)
+        provider._segments = [
+            SegmentInfo(Path(f"segment-{i}.ts"), i, 1000.0 + i * 30, 30.0)
+            for i in range(20)
+        ]
+
+        segments = provider.get_segments_for_window(1300.0, 240.0)
+
+        self.assertEqual(segments[0].index, 9)
+        self.assertEqual(segments[-1].index, 17)
+
+
+class VODHypeDetectorTests(unittest.TestCase):
+
+    def test_video_stream_validation_rejects_audio_only_file(self):
+        with patch("video_processor.subprocess.run") as mock_run:
+            mock_run.return_value = Mock(returncode=0, stdout="", stderr="")
+            self.assertFalse(_has_video_stream(Path("audio-only.webm")))
+
+        command = mock_run.call_args.args[0]
+        self.assertEqual(command[command.index("-select_streams") + 1], "v:0")
+
+    def test_loudness_measurement_uses_ffmpeg_and_parses_mean_volume(self):
+        detector = VODHypeDetector()
+        with patch("video_processor.subprocess.run") as mock_run:
+            mock_run.return_value = Mock(
+                returncode=0,
+                stdout="",
+                stderr="[Parsed_volumedetect_0] mean_volume: -18.5 dB",
+            )
+            reading = detector._measure_loudness_at(Path("video.mp4"), 40.0, 10.0)
+
+        self.assertEqual(reading, -18.5)
+        command = mock_run.call_args.args[0]
+        self.assertEqual(command[0], config.FFMPEG_BIN)
+        self.assertEqual(command[command.index("-ss") + 1], "40.0")
+
+    def test_detects_relative_audio_peak_using_vod_threshold(self):
+        detector = VODHypeDetector()
+        with (
+            patch("video_processor._probe_duration", return_value=600.0),
+            patch.object(
+                detector,
+                "_measure_loudness_at",
+                side_effect=lambda _path, offset, _duration: -15.0 if 300 <= offset < 320 else -22.0,
+            ),
+        ):
+            spikes = detector.find_spikes(Path("video.mp4"), 1000.0, max_clips=2)
+
+        self.assertEqual(spikes, [1300.0])
+
+    def test_uses_loudest_windows_when_no_threshold_spikes(self):
+        detector = VODHypeDetector()
+        with (
+            patch("video_processor._probe_duration", return_value=600.0),
+            patch.object(detector, "_measure_loudness_at", return_value=-20.0),
+        ):
+            spikes = detector.find_spikes(Path("video.mp4"), 1000.0, max_clips=2)
+
+        self.assertEqual(spikes, [1000.0, 1240.0])
+
+    def test_skips_vod_shorter_than_requested_clip(self):
+        detector = VODHypeDetector()
+        with (
+            patch("video_processor._probe_duration", return_value=120.0),
+            patch.object(detector, "_measure_loudness_at") as measure,
+        ):
+            spikes = detector.find_spikes(Path("video.mp4"), 1000.0)
+
+        self.assertEqual(spikes, [])
+        measure.assert_not_called()
+
+
+class ClipMakerTests(unittest.TestCase):
+
+    def test_blur_filtergraph_connects_overlay_to_title_once(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            raw_clip = temp_path / "raw.mp4"
+            srt_path = temp_path / "subs.srt"
+            out_path = temp_path / "output.mp4"
+            raw_clip.write_bytes(b"raw")
+            srt_path.write_text("", encoding="utf-8")
+            maker = ClipMaker(Mock(), Mock())
+
+            try:
+                with (
+                    patch("clip_maker._probe_video_dimensions", return_value=(1920, 1080)),
+                    patch(
+                        "clip_maker.subprocess.run",
+                        side_effect=lambda command, **_kwargs: (
+                            Path(command[-1]).write_bytes(b"encoded"),
+                            Mock(returncode=0, stderr=""),
+                        )[1],
+                    ) as run,
+                    patch.object(maker, "_validate_encoded_clip", return_value=True),
+                ):
+                    self.assertTrue(maker._encode_final(raw_clip, srt_path, "Title", out_path))
+                    self.assertTrue(out_path.exists())
+                    self.assertIn(".partial.mp4", Path(run.call_args.args[0][-1]).name)
+            finally:
+                maker.shutdown()
+
+        command = run.call_args.args[0]
+        filtergraph = command[command.index("-filter_complex") + 1]
+        self.assertIn("[bg][fg]overlay=(W-w)/2:(H-h)/2[base];[base]drawtext=", filtergraph)
+        self.assertNotIn("[base][base]", filtergraph)
+
+    def test_encoded_clip_validation_rejects_missing_moov(self):
+        maker = ClipMaker(Mock(), Mock())
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                clip_path = Path(temp_dir) / "incomplete.mp4"
+                clip_path.write_bytes(b"mdat" * 1000)
+                with patch(
+                    "clip_maker.subprocess.run",
+                    return_value=Mock(
+                        returncode=1,
+                        stdout="",
+                        stderr="moov atom not found",
+                    ),
+                ):
+                    self.assertFalse(maker._validate_encoded_clip(clip_path))
+        finally:
+            maker.shutdown()
 
 
 # ---------------------------------------------------------------------------

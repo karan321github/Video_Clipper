@@ -24,11 +24,13 @@ thread pool so that back-to-back spikes don't block each other.
 from __future__ import annotations
 
 import logging
+import json
 import os
 import re
 import subprocess
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional, Sequence
@@ -45,7 +47,7 @@ MAX_CONCURRENT_CLIPS = 2    # max parallel clip-making threads
 
 class ClipMaker:
     """
-    Receives spike events and produces vertical 9:16 MP4 clips with
+    Receives spike events and produces horizontal 16:9 MP4 clips with
     burned-in captions and a title overlay.
     """
 
@@ -114,8 +116,12 @@ class ClipMaker:
 
         try:
             # ── Step 1: gather segments ──────────────────────────────────
-            needed_seconds = config.CLIP_LOOKBACK + config.CLIP_DURATION + 5  # buffer
-            segments = self.recorder.get_segments_covering(needed_seconds)
+            needed_seconds = config.CLIP_LOOKBACK + config.CLIP_DURATION + 5
+            get_window = getattr(self.recorder, "get_segments_for_window", None)
+            if get_window:
+                segments = get_window(spike_time, config.CLIP_DURATION)
+            else:
+                segments = self.recorder.get_segments_covering(needed_seconds)
 
             if not segments:
                 log.warning("Clip %d: no segments available yet.", clip_id)
@@ -130,6 +136,16 @@ class ClipMaker:
             if not self._extract_raw_clip(concat_list, raw_clip, segments, spike_time):
                 self.clips_failed += 1
                 return
+            raw_duration = _probe_media_duration(raw_clip)
+            if raw_duration + 2.0 < config.CLIP_DURATION:
+                log.error(
+                    "Clip %d extraction is only %.1f s; expected %d s. Skipping short output.",
+                    clip_id,
+                    raw_duration,
+                    config.CLIP_DURATION,
+                )
+                self.clips_failed += 1
+                return
 
             # ── Step 3: generate title from chat ────────────────────────
             title = generate_title(recent_chat)
@@ -142,7 +158,8 @@ class ClipMaker:
             # ── Step 5: encode final horizontal 16:9 clip ────────────────
             safe_title = _safe_filename(title)
             ts_str     = time.strftime("%Y%m%d_%H%M%S", time.localtime(spike_time))
-            out_path   = config.CLIPS_DIR / f"clip_{ts_str}_{safe_title}.mp4"
+            job_suffix = uuid.uuid4().hex[:8]
+            out_path   = config.CLIPS_DIR / f"clip_{ts_str}_{safe_title}_{job_suffix}.mp4"
 
             if not self._encode_final(raw_clip, srt_path, title, out_path):
                 self.clips_failed += 1
@@ -182,6 +199,13 @@ class ClipMaker:
         # Calculate how far from the START of our segment buffer the clip begins
         earliest_wall = segments[0].wall_start
         total_duration = sum(s.duration for s in segments)
+        if total_duration < config.CLIP_DURATION:
+            log.warning(
+                "Clip buffer is only %.1f s; waiting for at least %d s before making a clip.",
+                total_duration,
+                config.CLIP_DURATION,
+            )
+            return False
         clip_start_wall = spike_time - config.CLIP_LOOKBACK
 
         # Offset from beginning of concat buffer
@@ -290,7 +314,12 @@ class ClipMaker:
         # ── Build video filter chain ───────────────────────────────────────
         fill_mode = config.OUTPUT_FILL_MODE.lower()
         inputs = ["-i", str(raw_clip)]
-        if cam_clip and cam_clip.exists() and cam_clip.stat().st_size > 1000:
+        if (
+            config.INCLUDE_STREAMER_CAM.lower() != "off"
+            and cam_clip
+            and cam_clip.exists()
+            and cam_clip.stat().st_size > 1000
+        ):
             inputs += ["-i", str(cam_clip)]
             has_cam = True
         else:
@@ -301,11 +330,11 @@ class ClipMaker:
             bg = (
                 f"[0:v]scale={w}:{h}:force_original_aspect_ratio=increase,"
                 f"crop={w}:{h},"
-                f"boxblur=20:5[bg];"
+                f"boxblur=20:5[bg]"
             )
             # Foreground: scale source to fit inside 1920×1080 (letterbox / pillarbox)
             fg = (
-                f"[0:v]scale={w}:{h}:force_original_aspect_ratio=decrease[fg];"
+                f"[0:v]scale={w}:{h}:force_original_aspect_ratio=decrease[fg]"
             )
             # Overlay fg centered over bg
             overlay_base = (
@@ -324,11 +353,11 @@ class ClipMaker:
         if has_cam:
             cam_w = int(w * config.CAM_OVERLAY_WIDTH_FRAC)
             # Maintain cam aspect ratio by scaling width, height auto
-            cam_scale = f"[1:v]scale={cam_w}:-1[cam];"
+            cam_scale = f"[1:v]scale={cam_w}:-1[cam]"
             margin    = config.CAM_OVERLAY_MARGIN
             cam_x     = f"W-w-{margin}"
             cam_y     = f"H-h-{margin}"
-            cam_composite = f";[base][cam]overlay={cam_x}:{cam_y}[composited]"
+            cam_composite = f"[base][cam]overlay={cam_x}:{cam_y}[composited]"
             final_label   = "composited"
         else:
             cam_scale     = ""
@@ -341,7 +370,7 @@ class ClipMaker:
         sub_filter  = ""
         if has_subs:
             sub_filter = (
-                f",subtitles='{srt_escaped}'"
+                f"subtitles='{srt_escaped}'"
                 f":force_style='FontSize={config.CAPTION_FONT_SIZE},"
                 f"PrimaryColour=&Hffffff,"
                 f"OutlineColour=&H000000,"
@@ -353,7 +382,7 @@ class ClipMaker:
         # ── Title drawtext ────────────────────────────────────────────────
         title_escaped = title.replace("'", "\\'").replace(":", "\\:")[:config.TITLE_MAX_CHARS]
         title_filter  = (
-            f",drawtext=text='{title_escaped}'"
+            f"drawtext=text='{title_escaped}'"
             f":fontsize={config.TITLE_FONT_SIZE}"
             f":fontcolor={config.TITLE_FONT_COLOR}"
             f":box=1:boxcolor={config.TITLE_BG_COLOR}"
@@ -364,24 +393,20 @@ class ClipMaker:
 
         # ── Assemble filtergraph ──────────────────────────────────────────
         if fill_mode == "blur":
-            filtergraph = (
-                f"{bg}"
-                f"{fg}"
-                f"{overlay_base}"
-                f"{cam_scale}"
-                f"{cam_composite}"
-                f"[{final_label}]{sub_filter}{title_filter}"
-            )
+            filter_parts = [bg, fg, overlay_base]
         else:
-            filtergraph = (
-                f"{overlay_base}"
-                f"{cam_scale}"
-                f"{cam_composite}"
-                f"[{final_label}]{sub_filter}{title_filter}"
-            )
+            filter_parts = [overlay_base]
+        filter_parts.extend(part for part in (cam_scale, cam_composite) if part)
+        video_filters = [part for part in (sub_filter, title_filter) if part]
+        filter_parts.append(f"[{final_label}]{','.join(video_filters)}")
+        filtergraph = ";".join(filter_parts)
 
-        # Encode timeout: 60 s base + 1 s per second of clip content
-        encode_timeout = 60 + config.CLIP_DURATION
+        # A long CPU encode can take several minutes, especially when other
+        # clipping processes are running.
+        encode_timeout = max(900, config.CLIP_DURATION * 10)
+        temp_out = out_path.with_name(
+            f".{out_path.stem}.{uuid.uuid4().hex[:8]}.partial.mp4"
+        )
 
         cmd = [
             config.FFMPEG_BIN,
@@ -397,7 +422,7 @@ class ClipMaker:
             "-c:a", "aac",
             "-b:a", "128k",
             "-movflags", "+faststart",
-            str(out_path),
+            str(temp_out),
         ]
 
         log.debug("ffmpeg filtergraph: %s", filtergraph)
@@ -406,10 +431,79 @@ class ClipMaker:
             if result.returncode != 0:
                 log.error("ffmpeg final encode failed:\n%s", result.stderr[-2000:])
                 return False
+            if not self._validate_encoded_clip(temp_out):
+                log.error("ffmpeg output is incomplete or invalid; not saving %s.", out_path.name)
+                return False
+            os.replace(temp_out, out_path)
             return True
         except subprocess.TimeoutExpired:
-            log.error("ffmpeg final encode timed out.")
+            log.error(
+                "ffmpeg final encode timed out after %d s; incomplete output discarded.",
+                encode_timeout,
+            )
             return False
+        except OSError:
+            log.exception("Could not publish encoded clip %s.", out_path)
+            return False
+        finally:
+            try:
+                temp_out.unlink(missing_ok=True)
+            except OSError:
+                log.warning("Could not remove incomplete encode %s.", temp_out)
+
+    def _validate_encoded_clip(self, path: Path) -> bool:
+        """Check that ffmpeg produced a playable, full-duration H.264 MP4."""
+        if not path.exists() or path.stat().st_size < 1000:
+            log.error("Encoded output is missing or too small: %s", path)
+            return False
+
+        cmd = [
+            config.FFPROBE_BIN,
+            "-v", "error",
+            "-show_entries", "format=format_name,duration",
+            "-show_entries", "stream=codec_type,codec_name",
+            "-of", "json",
+            str(path),
+        ]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        except FileNotFoundError:
+            log.error("ffprobe not found; cannot validate encoded clip.")
+            return False
+        except subprocess.TimeoutExpired:
+            log.error("Timed out validating encoded clip %s.", path)
+            return False
+
+        if result.returncode != 0:
+            log.error("ffprobe rejected encoded clip %s: %s", path, result.stderr.strip())
+            return False
+        try:
+            metadata = json.loads(result.stdout)
+            duration = float(metadata["format"]["duration"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            log.error("ffprobe returned invalid clip metadata for %s.", path)
+            return False
+
+        format_name = metadata.get("format", {}).get("format_name", "")
+        streams = metadata.get("streams", [])
+        has_h264_video = any(
+            stream.get("codec_type") == "video"
+            and stream.get("codec_name") == "h264"
+            for stream in streams
+        )
+        if (
+            "mp4" not in format_name.split(",")
+            or not has_h264_video
+            or duration < config.CLIP_DURATION - 2
+        ):
+            log.error(
+                "Encoded clip validation failed: format=%s, h264_video=%s, duration=%.1f s.",
+                format_name,
+                has_h264_video,
+                duration,
+            )
+            return False
+        return True
 
     # ── Cleanup ─────────────────────────────────────────────────────────────
 
@@ -449,6 +543,33 @@ def _probe_video_dimensions(video_path: Path) -> tuple[int, int]:
     except Exception as exc:
         log.debug("_probe_video_dimensions failed: %s", exc)
     return 0, 0
+
+
+def _probe_media_duration(video_path: Path) -> float:
+    """Return media duration in seconds, or zero when ffprobe cannot read it."""
+    cmd = [
+        config.FFPROBE_BIN,
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "csv=p=0",
+        str(video_path),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+    except FileNotFoundError:
+        log.error("ffprobe not found while validating extracted clip duration.")
+        return 0.0
+    except subprocess.TimeoutExpired:
+        log.error("ffprobe timed out while validating %s.", video_path)
+        return 0.0
+    if result.returncode != 0:
+        log.error("ffprobe could not read extracted clip duration: %s", result.stderr.strip())
+        return 0.0
+    try:
+        return float(result.stdout.strip())
+    except ValueError:
+        log.error("ffprobe returned an invalid duration for %s.", video_path)
+        return 0.0
 
 
 # ---------------------------------------------------------------------------
