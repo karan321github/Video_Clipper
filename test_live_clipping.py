@@ -9,8 +9,18 @@ import config
 from clip_maker import ClipMaker
 from chat_reader import YouTubeChatReader
 from hype_detector import HypeDetector
+from media_tools import probe_media
 from recorder import SegmentInfo, StreamRecorder
+from timestamps import (
+    ClipRange,
+    TimestampError,
+    build_hype_range,
+    parse_range,
+    parse_timestamp,
+    validate_range,
+)
 from video_processor import (
+    describe_ytdlp_error,
     normalize_youtube_url,
     probe_video,
     VideoInfo,
@@ -324,6 +334,7 @@ class VODHypeDetectorTests(unittest.TestCase):
         detector = VODHypeDetector()
         with (
             patch("video_processor._probe_duration", return_value=600.0),
+            patch.object(detector, "_measure_all_windows", return_value=None),
             patch.object(
                 detector,
                 "_measure_loudness_at",
@@ -334,26 +345,45 @@ class VODHypeDetectorTests(unittest.TestCase):
 
         self.assertEqual(spikes, [1300.0])
 
+    def test_single_pass_scan_results_are_used(self):
+        detector = VODHypeDetector()
+        samples = [(t * 10.0, -15.0 if t == 30 else -22.0) for t in range(60)]
+        with (
+            patch.object(detector, "_measure_all_windows", return_value=samples),
+            patch.object(detector, "_measure_loudness_at") as per_window,
+        ):
+            spikes = detector.find_spikes(Path("video.mp4"), 0.0, max_clips=2, duration=600.0)
+
+        self.assertEqual(spikes, [300.0])
+        per_window.assert_not_called()
+
     def test_uses_loudest_windows_when_no_threshold_spikes(self):
         detector = VODHypeDetector()
         with (
             patch("video_processor._probe_duration", return_value=600.0),
+            patch.object(detector, "_measure_all_windows", return_value=None),
             patch.object(detector, "_measure_loudness_at", return_value=-20.0),
         ):
             spikes = detector.find_spikes(Path("video.mp4"), 1000.0, max_clips=2)
 
         self.assertEqual(spikes, [1000.0, 1240.0])
 
-    def test_skips_vod_shorter_than_requested_clip(self):
+    def test_vod_shorter_than_clip_still_yields_one_moment(self):
+        detector = VODHypeDetector()
+        samples = [(t * 10.0, -20.0) for t in range(12)]
+        with patch.object(detector, "_measure_all_windows", return_value=samples):
+            spikes = detector.find_spikes(Path("video.mp4"), 0.0, max_clips=5, duration=120.0)
+
+        self.assertEqual(len(spikes), 1)
+
+    def test_unknown_duration_returns_no_spikes(self):
         detector = VODHypeDetector()
         with (
-            patch("video_processor._probe_duration", return_value=120.0),
-            patch.object(detector, "_measure_loudness_at") as measure,
+            patch("video_processor._probe_duration", return_value=0.0),
+            patch.object(detector, "_measure_all_windows") as scan,
         ):
-            spikes = detector.find_spikes(Path("video.mp4"), 1000.0)
-
-        self.assertEqual(spikes, [])
-        measure.assert_not_called()
+            self.assertEqual(detector.find_spikes(Path("video.mp4"), 0.0), [])
+        scan.assert_not_called()
 
 
 class ClipMakerTests(unittest.TestCase):
@@ -370,26 +400,32 @@ class ClipMakerTests(unittest.TestCase):
 
             try:
                 with (
-                    patch("clip_maker._probe_video_dimensions", return_value=(1920, 1080)),
                     patch(
-                        "clip_maker.subprocess.run",
+                        "clip_maker.run_ffmpeg",
                         side_effect=lambda command, **_kwargs: (
                             Path(command[-1]).write_bytes(b"encoded"),
-                            Mock(returncode=0, stderr=""),
+                            Mock(returncode=0, stderr="", cancelled=False, timed_out=False),
                         )[1],
                     ) as run,
-                    patch.object(maker, "_validate_encoded_clip", return_value=True),
+                    patch.object(maker, "_verify_output", return_value=None),
                 ):
-                    self.assertTrue(maker._encode_final(raw_clip, srt_path, "Title", out_path))
+                    self.assertTrue(maker._encode_final(
+                        raw_clip, srt_path, "100% Can't: believe", out_path, duration=10.0,
+                    ))
                     self.assertTrue(out_path.exists())
                     self.assertIn(".partial.mp4", Path(run.call_args.args[0][-1]).name)
+                    title_files = list(temp_path.glob("title_*.txt"))
+                    self.assertEqual(title_files[0].read_text(encoding="utf-8"), "100% Can't: believe")
             finally:
                 maker.shutdown()
 
         command = run.call_args.args[0]
         filtergraph = command[command.index("-filter_complex") + 1]
         self.assertIn("[bg][fg]overlay=(W-w)/2:(H-h)/2[base];[base]drawtext=", filtergraph)
+        self.assertIn("expansion=none", filtergraph)
         self.assertNotIn("[base][base]", filtergraph)
+        # Input seeking: -ss/-t must come before -i for accurate re-encoded cuts.
+        self.assertLess(command.index("-t"), command.index("-i"))
 
     def test_encoded_clip_validation_rejects_missing_moov(self):
         maker = ClipMaker(Mock(), Mock())
@@ -408,6 +444,204 @@ class ClipMakerTests(unittest.TestCase):
                     self.assertFalse(maker._validate_encoded_clip(clip_path))
         finally:
             maker.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# New tests — timestamps / clip ranges
+# ---------------------------------------------------------------------------
+
+class TimestampTests(unittest.TestCase):
+
+    def test_supported_formats(self):
+        self.assertEqual(parse_timestamp("00:02:15"), 135.0)
+        self.assertEqual(parse_timestamp("2:15"), 135.0)
+        self.assertEqual(parse_timestamp("135"), 135.0)
+        self.assertEqual(parse_timestamp("1:00:00.5"), 3600.5)
+        self.assertEqual(parse_range("00:02:15-00:02:55"), (135.0, 175.0))
+
+    def test_rejects_negative_and_malformed(self):
+        for bad in ("-5", "-00:01:00", "abc", "1:75", "1:61:00", ""):
+            with self.assertRaises(TimestampError, msg=bad):
+                parse_timestamp(bad)
+
+    def test_validate_range_errors(self):
+        with self.assertRaisesRegex(TimestampError, "must be after"):
+            validate_range(60, 30, 600)
+        with self.assertRaisesRegex(TimestampError, "beyond the video duration"):
+            validate_range(500, 700, 600)
+        with self.assertRaisesRegex(TimestampError, "beyond the video duration"):
+            validate_range(650, 700, 600)
+        self.assertEqual(validate_range(135, 175, 600).duration, 40.0)
+
+    def test_hype_range_is_shifted_inside_video(self):
+        r = build_hype_range(5.0, 20, 220, 600)
+        self.assertEqual((r.start, r.end), (0.0, 240.0))
+        r = build_hype_range(590.0, 20, 220, 600)
+        self.assertEqual((r.start, r.end), (360.0, 600.0))
+        r = build_hype_range(300.0, 20, 220, 600)
+        self.assertEqual((r.start, r.end, r.hype_time), (280.0, 520.0, 300.0))
+
+    def test_hype_range_shrinks_for_short_video(self):
+        r = build_hype_range(30.0, 20, 220, 90.0)
+        self.assertEqual((r.start, r.end), (0.0, 90.0))
+
+
+class YtDlpErrorTests(unittest.TestCase):
+
+    def test_common_errors_are_described(self):
+        self.assertIn("private", describe_ytdlp_error("ERROR: [youtube] x: Private video. Sign in"))
+        self.assertIn("age-restricted", describe_ytdlp_error("Sign in to confirm your age"))
+        self.assertIn("not started", describe_ytdlp_error("ERROR: This live event will begin in 3 hours"))
+        self.assertEqual(
+            describe_ytdlp_error("ERROR: [youtube] AAAAAAAAAAA: This video is unavailable"),
+            "The video is unavailable.",
+        )
+
+    def test_upcoming_live_status_detected(self):
+        import json
+        meta = {"id": "x", "title": "t", "duration": None, "live_status": "is_upcoming"}
+        with patch("video_processor.subprocess.run") as run:
+            run.return_value = Mock(returncode=0, stdout=json.dumps(meta), stderr="")
+            info = probe_video("https://www.youtube.com/watch?v=x")
+        self.assertTrue(info.is_upcoming)
+        self.assertFalse(info.is_live)
+
+
+class FfmpegErrorReportingTests(unittest.TestCase):
+
+    def test_root_cause_line_is_reported_not_cascade_noise(self):
+        from media_tools import ProcessResult
+        stderr = [
+            "Fontconfig error: Cannot load default config file: File not found",
+            "[libx264 @ 0000029ceb86cd80] width not divisible by 2 (1921x1080)",
+            "[vost#0:0/libx264 @ 0000029ceb86cb00] [enc:libx264 @ 0000029ceb4db240] Error while "
+            "opening encoder - maybe incorrect parameters such as bit_rate, rate, width or height.",
+            "[fc#0 @ 0000029ce7ad6bc0] Task finished with error code: -542398533",
+            "[out#0/mp4 @ 0000029ce7ad5000] Nothing was written into output file, because at "
+            "least one of its streams received no packets.",
+        ]
+        result = ProcessResult(3752568763, [], stderr)
+        self.assertEqual(result.last_error_line(), "width not divisible by 2 (1921x1080)")
+        self.assertEqual(result.signed_returncode, -542398533)
+
+    def test_urls_are_redacted_in_logged_commands(self):
+        from media_tools import format_cmd
+        logged = format_cmd(["ffmpeg", "-i", "https://rr1.googlevideo.com/videoplayback?sig=SECRET&key=x"])
+        self.assertNotIn("SECRET", logged)
+        self.assertIn("googlevideo.com/videoplayback", logged)
+
+
+class RecorderWindowTests(unittest.TestCase):
+
+    def test_get_segments_between_returns_contiguous_overlap(self):
+        recorder = StreamRecorder("https://www.youtube.com/watch?v=stream")
+        for idx in (1, 2, 4, 5, 6):
+            recorder._segments.append(SegmentInfo(Path(f"s{idx}.ts"), idx, idx * 30.0, 30.0))
+        segments = recorder.get_segments_between(100.0, 200.0)
+        self.assertEqual([s.index for s in segments], [4, 5, 6])
+
+
+# ---------------------------------------------------------------------------
+# Integration tests — real ffmpeg clip rendering (skipped without ffmpeg)
+# ---------------------------------------------------------------------------
+
+def _ffmpeg_available() -> bool:
+    import shutil as _sh
+    return bool(_sh.which(config.FFMPEG_BIN) or Path(config.FFMPEG_BIN).exists())
+
+
+@unittest.skipUnless(_ffmpeg_available(), "ffmpeg not installed")
+class SourceClipRenderingTests(unittest.TestCase):
+    """Render real clips from a synthetic YouTube-like VP9/Opus source."""
+
+    @classmethod
+    def setUpClass(cls):
+        import subprocess
+        cls._tmp = tempfile.TemporaryDirectory()
+        cls.tmp = Path(cls._tmp.name)
+        cls.source = cls.tmp / "source.mp4"
+        base = [config.FFMPEG_BIN, "-v", "error", "-y",
+                "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=30",
+                "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000", "-t", "20"]
+        vp9 = subprocess.run(
+            base + ["-c:v", "libvpx-vp9", "-deadline", "realtime", "-cpu-used", "8",
+                    "-c:a", "libopus", str(cls.source)],
+            capture_output=True,
+        )
+        if vp9.returncode != 0:   # ffmpeg build without libvpx/libopus
+            subprocess.run(base + ["-c:v", "libx264", "-c:a", "aac", str(cls.source)], check=True)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._tmp.cleanup()
+
+    def setUp(self):
+        self.clips = self.tmp / f"clips_{self._testMethodName}"
+        self.work = self.tmp / f"work_{self._testMethodName}"
+        self.patches = [
+            patch.object(config, "CLIPS_DIR", self.clips),
+            patch.object(config, "TMP_DIR", self.work),
+            patch.object(config, "OUTPUT_WIDTH", 640),
+            patch.object(config, "OUTPUT_HEIGHT", 360),
+        ]
+        for p in self.patches:
+            p.start()
+        self.maker = ClipMaker(None, None, captions=False)
+
+    def tearDown(self):
+        self.maker.shutdown()
+        for p in self.patches:
+            p.stop()
+
+    def test_manual_clip_has_exact_duration_and_streams(self):
+        result = self.maker.render_source_clip(
+            self.source, ClipRange(5.0, 9.0), title="100% it's: [hype]", video_label="vid",
+        )
+        self.assertTrue(result.ok, result.error)
+        media = probe_media(result.path)
+        self.assertTrue(media.has_video and media.has_audio)
+        self.assertEqual(media.video_codec, "h264")
+        self.assertAlmostEqual(media.duration, 4.0, delta=config.CLIP_DURATION_TOLERANCE)
+        self.assertEqual(list(self.work.iterdir()), [], "temp job dirs must be cleaned up")
+
+    def test_out_of_range_timestamps_fail_validation(self):
+        result = self.maker.render_source_clip(self.source, ClipRange(15.0, 60.0))
+        self.assertFalse(result.ok)
+        self.assertEqual(result.stage, "validate")
+        self.assertIn("beyond the video duration", result.error)
+        self.assertEqual(list(self.clips.glob("*.mp4")), [])
+
+    def test_ffmpeg_failure_is_reported_and_not_marked_successful(self):
+        from media_tools import ProcessResult
+        failing = ProcessResult(1, [], ["Error opening output file: Invalid argument"])
+        with patch("clip_maker.run_ffmpeg", return_value=failing):
+            result = self.maker.render_source_clip(self.source, ClipRange(1.0, 3.0))
+        self.assertFalse(result.ok)
+        self.assertEqual(result.stage, "encode")
+        self.assertIn("FFmpeg processing failed", result.error)
+        self.assertIn("exit code 1", result.error)
+        self.assertEqual(self.maker.clips_made, 0)
+        self.assertEqual(self.maker.clips_failed, 1)
+        self.assertEqual(list(self.clips.glob("*.mp4")), [])
+
+    def test_truncated_output_fails_verification(self):
+        result = self.maker.render_source_clip(self.source, ClipRange(0.0, 2.0))
+        self.assertTrue(result.ok, result.error)
+        # A 2 s file must be rejected when 10 s was requested.
+        reason = self.maker._verify_output(result.path, expected_duration=10.0)
+        self.assertIn("requested", reason)
+
+    def test_parallel_clips_get_unique_files(self):
+        ranges = [ClipRange(0.0, 2.0), ClipRange(0.0, 2.0), ClipRange(4.0, 6.0)]
+        futures = [
+            self.maker.submit_source_clip(self.source, r, index=i, video_label="vid")
+            for i, r in enumerate(ranges, start=1)
+        ]
+        results = [f.result() for f in futures]
+        self.assertTrue(all(r.ok for r in results), [r.error for r in results])
+        paths = {r.path for r in results}
+        self.assertEqual(len(paths), 3)
+        self.assertTrue(all(p.exists() for p in paths))
 
 
 # ---------------------------------------------------------------------------

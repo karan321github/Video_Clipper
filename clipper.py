@@ -1,4 +1,4 @@
-"""
+﻿"""
 clipper.py — GTAClipper Main Orchestrator
 ==========================================
 Entry point. Wires together Recorder → ChatReader → HypeDetector → ClipMaker.
@@ -53,15 +53,24 @@ import config
 from recorder      import StreamRecorder
 from chat_reader   import make_chat_reader
 from hype_detector import HypeDetector
-from clip_maker    import ClipMaker
+from clip_maker    import ClipMaker, ClipResult, captions_available
+from media_tools   import probe_media
+from timestamps    import (
+    ClipRange,
+    TimestampError,
+    build_hype_range,
+    format_timestamp,
+    parse_range,
+    parse_timestamp,
+    validate_range,
+)
 from video_processor import (
-    probe_video,
+    probe_video_detailed,
     normalize_youtube_url,
     download_video,
-    OfflineSegmentProvider,
     VODHypeDetector,
-    NullChatReader,
     VideoInfo,
+    VideoSourceError,
 )
 
 # Force UTF-8 output on Windows so Unicode chars don't crash
@@ -162,6 +171,53 @@ def _parse_args() -> argparse.Namespace:
         "--debug",
         action="store_true",
         help="Enable DEBUG-level logging.",
+    )
+
+    manual = parser.add_argument_group(
+        "manual clipping (regular videos & replays)",
+        "Clip exact timestamps instead of (or after) automatic hype detection. "
+        "Timestamps accept HH:MM:SS, MM:SS or seconds.",
+    )
+    manual.add_argument("--start", help="Manual clip start, e.g. 00:02:15.")
+    manual.add_argument("--end", help="Manual clip end, e.g. 00:02:55.")
+    manual.add_argument(
+        "--clip", action="append", default=[], metavar="START-END",
+        help="Manual clip range, e.g. 00:02:15-00:02:55. Repeatable.",
+    )
+    manual.add_argument(
+        "--duration", default=None,
+        help=(
+            "Clip length. Manual mode: used with --start when --end is omitted. "
+            f"Automatic mode: length of each hype clip (default {config.CLIP_DURATION}s)."
+        ),
+    )
+    manual.add_argument(
+        "--padding-before", default=None,
+        help=f"Automatic mode: time kept before each hype moment (default {config.CLIP_LOOKBACK}s).",
+    )
+    manual.add_argument(
+        "--padding-after", default=None,
+        help="Automatic mode: time kept after each hype moment (default: duration - padding-before).",
+    )
+    manual.add_argument(
+        "--review", action="store_true",
+        help="Automatic mode: review/edit the detected timestamps before clips are generated.",
+    )
+    manual.add_argument(
+        "--detect-only", action="store_true",
+        help="Automatic mode: only print detected clip ranges (re-use them with --clip).",
+    )
+    manual.add_argument(
+        "--info", action="store_true",
+        help="Only load and print the video information (type, duration).",
+    )
+    manual.add_argument(
+        "--no-captions", action="store_true",
+        help="Skip faster-whisper transcription.",
+    )
+    manual.add_argument(
+        "--open", action="store_true",
+        help="Open each finished clip in the default video player for preview.",
     )
     return parser.parse_args()
 
@@ -326,16 +382,13 @@ def _check_dependencies() -> bool:
         )
         ok = False
 
-    # faster-whisper
-    try:
-        import faster_whisper  # noqa: F401
-    except ImportError:
+    # faster-whisper (optional: only needed for burned-in captions)
+    if not captions_available():
         print(
-            "[ERROR] faster-whisper not installed.\n"
+            "[WARN]  faster-whisper not installed — clips will have no captions.\n"
             "        Install with: pip install faster-whisper",
             file=sys.stderr,
         )
-        ok = False
 
     return ok
 
@@ -371,7 +424,7 @@ def _run_live(args: argparse.Namespace, platform: str) -> int:
     # Build component graph
     recorder    = StreamRecorder(args.url)
     chat_reader = make_chat_reader(platform, args.url, twitch_channel)
-    clip_maker  = ClipMaker(recorder, chat_reader)
+    clip_maker  = ClipMaker(recorder, chat_reader, captions=not args.no_captions)
     detector    = HypeDetector(
         chat_reader=chat_reader,
         recorder=recorder,
@@ -435,82 +488,297 @@ def _run_live(args: argparse.Namespace, platform: str) -> int:
 
 
 # ---------------------------------------------------------------------------
-# VOD / regular video mode
+# VOD / regular video / manual clipping mode
 # ---------------------------------------------------------------------------
 
-def _run_vod(args: argparse.Namespace, info: VideoInfo) -> int:
+def _parse_seconds(value: str | None, flag: str, default: float) -> float:
+    if value is None:
+        return default
+    seconds = parse_timestamp(value)
+    if seconds <= 0:
+        raise TimestampError(f"{flag} must be greater than zero.")
+    return seconds
+
+
+def _manual_ranges(args: argparse.Namespace) -> list[tuple[float, float]]:
+    """Parse manual timestamps from the CLI (shape only; duration is checked later)."""
+    ranges = [parse_range(text) for text in args.clip]
+    if args.start is not None or args.end is not None:
+        if args.start is None:
+            raise TimestampError("--end requires --start.")
+        start = parse_timestamp(args.start)
+        if args.end is not None:
+            end = parse_timestamp(args.end)
+        elif args.duration is not None:
+            end = start + _parse_seconds(args.duration, "--duration", 0)
+        else:
+            raise TimestampError("--start requires --end or --duration.")
+        ranges.append((start, end))
+    for start, end in ranges:
+        if end <= start:
+            raise TimestampError(
+                f"End time ({format_timestamp(end)}) must be after start time "
+                f"({format_timestamp(start)})."
+            )
+    return ranges
+
+
+def _hype_window(args: argparse.Namespace) -> tuple[float, float]:
+    """(seconds before, seconds after) each detected hype moment."""
+    clip_len = _parse_seconds(args.duration, "--duration", float(config.CLIP_DURATION))
+    before = (
+        parse_timestamp(args.padding_before)
+        if args.padding_before is not None
+        else min(float(config.CLIP_LOOKBACK), clip_len)
+    )
+    after = (
+        parse_timestamp(args.padding_after)
+        if args.padding_after is not None
+        else max(0.0, clip_len - before)
+    )
+    if before + after <= 0:
+        raise TimestampError("Padding before + after must be greater than zero.")
+    return before, after
+
+
+def _print_ranges(ranges: list[ClipRange]) -> None:
+    for i, r in enumerate(ranges, start=1):
+        hype = f"  (hype at {format_timestamp(r.hype_time)})" if r.hype_time is not None else ""
+        print(f"  {i:>2}. {r.label()}  [{r.duration:.0f}s]{hype}")
+
+
+def _review_ranges(ranges: list[ClipRange], video_duration: float) -> list[ClipRange]:
+    """Let the user keep, skip or edit each detected range interactively."""
+    if not sys.stdin.isatty():
+        log.warning("--review needs an interactive terminal; using detected ranges as-is.")
+        return ranges
+    print(
+        "\nReview detected clips — Enter = keep, s = skip, "
+        "or type a new START-END (e.g. 00:01:00-00:01:40):"
+    )
+    reviewed: list[ClipRange] = []
+    for i, r in enumerate(ranges, start=1):
+        while True:
+            hype = format_timestamp(r.hype_time) if r.hype_time is not None else "-"
+            answer = input(f"  Clip {i} [{r.label()}] (hype at {hype}): ").strip()
+            if not answer:
+                reviewed.append(r)
+                break
+            if answer.lower() in ("s", "skip"):
+                break
+            try:
+                start, end = parse_range(answer)
+                edited = validate_range(start, end, video_duration, config.MANUAL_CLIP_MIN_DURATION)
+                edited.hype_time = r.hype_time
+                reviewed.append(edited)
+                break
+            except TimestampError as exc:
+                print(f"    ❌ {exc}")
+    return reviewed
+
+
+def _open_file(path: Path) -> None:
+    try:
+        if sys.platform == "win32":
+            os.startfile(str(path))  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            import subprocess
+            subprocess.Popen(["open", str(path)])
+        else:
+            import subprocess
+            subprocess.Popen(["xdg-open", str(path)])
+    except Exception as exc:
+        log.warning("Could not open %s for preview: %s", path, exc)
+
+
+def _render_ranges(
+    args: argparse.Namespace,
+    info: VideoInfo,
+    video_path: Path,
+    ranges: list[ClipRange],
+    min_duration: float,
+) -> list[ClipResult]:
+    """Generate one clip per range, printing per-clip progress."""
+    total = len(ranges)
+    print_lock = threading.Lock()
+    last_report: dict[int, tuple[str, int]] = {}
+
+    def progress(result: ClipResult, stage: str, fraction: float) -> None:
+        step = int(fraction * 10)
+        with print_lock:
+            if last_report.get(result.index) == (stage, step):
+                return
+            last_report[result.index] = (stage, step)
+            prefix = f"  [clip {result.index}/{total} {result.label()}]"
+            if stage == "encoding":
+                print(f"{prefix} encoding {step * 10:3d}%", flush=True)
+            elif stage == "ok":
+                print(f"{prefix} ✅ done → {result.path}", flush=True)
+            elif stage == "failed":
+                print(f"{prefix} ❌ {result.error}", flush=True)
+            else:
+                print(f"{prefix} {stage}…", flush=True)
+
+    maker = ClipMaker(None, None, captions=not args.no_captions)
+    title = (info.title or "Hype Moment")[: config.TITLE_MAX_CHARS]
+    futures = [
+        maker.submit_source_clip(
+            video_path, r, index=i, title=title, video_label=info.video_id,
+            min_duration=min_duration, progress=progress,
+        )
+        for i, r in enumerate(ranges, start=1)
+    ]
+    try:
+        results = [f.result() for f in futures]
+    except KeyboardInterrupt:
+        print("\nCancelling clip generation…")
+        maker.shutdown(cancel=True)
+        raise
+    maker.shutdown()
+    if args.open:
+        for r in results:
+            if r.ok and r.path:
+                _open_file(r.path)
+    return results
+
+
+def _summarise(args: argparse.Namespace, results: list[ClipResult]) -> None:
+    ok = [r for r in results if r.ok]
+    failed = [r for r in results if not r.ok]
+    print(f"\n{'─' * 70}\nResults: {len(ok)} succeeded, {len(failed)} failed")
+    for r in results:
+        if r.ok:
+            print(f"  ✅ {r.index:>2}. {r.label()}  {r.path}")
+        else:
+            print(f"  ❌ {r.index:>2}. {r.label()}  {r.error}")
+    if failed:
+        clips = " ".join(f"--clip {r.label()}" for r in failed)
+        print(f"\nRetry failed clips with:\n  python clipper.py {args.url} {clips}")
+    print(f"Log file: {config.LOG_FILE}")
+
+
+def _run_vod(
+    args: argparse.Namespace,
+    info: VideoInfo,
+    manual: list[tuple[float, float]],
+) -> int:
     """
-    Offline video pipeline for published VODs and archived streams.
-    Downloads the full video, segments it, runs VODHypeDetector,
-    then passes each spike to ClipMaker.
+    Pipeline for regular videos and completed livestream replays:
+    download once → (detect hype moments | manual ranges) → clip from source.
     """
     log.info("VOD mode — %s (%s, %.0fs)", info.title, info.source_type, info.duration)
-    log.info("Output: %dx%d (%s fill)", config.OUTPUT_WIDTH, config.OUTPUT_HEIGHT,
-             config.OUTPUT_FILL_MODE)
 
-    # Download
-    dl_dir     = config.TMP_DIR / "downloads"
-    video_path = download_video(args.url, dl_dir, info.video_id)
-    if not video_path:
-        log.error("Video download failed. Cannot continue.")
-        return 1
+    # Fail fast on timestamps that can't fit the reported duration.
+    if manual and info.duration > 0:
+        try:
+            for start, end in manual:
+                validate_range(start, end, info.duration, config.MANUAL_CLIP_MIN_DURATION)
+        except TimestampError as exc:
+            print(f"\n❌ Invalid clip timestamps: {exc}", file=sys.stderr)
+            return 2
 
-    # Segment into rolling .ts chunks
-    provider = OfflineSegmentProvider(video_path, info.duration or _get_local_duration(video_path))
-    if not provider.prepare():
-        log.error("Segmentation failed. Cannot continue.")
-        return 1
-
-    # Use NullChatReader (no live chat for VODs)
-    chat_reader = NullChatReader()
-
-    # Create ClipMaker using the OfflineSegmentProvider as the recorder
-    clip_maker = ClipMaker(provider, chat_reader)  # type: ignore[arg-type]
-
-    # Detect spikes in the VOD
-    base_wall = provider.video_start_time
-    vod_detector = VODHypeDetector()
-    spikes = vod_detector.find_spikes(
-        video_path=video_path,
-        base_wall_time=base_wall,
-        max_clips=args.max_clips,
-        threshold_db=args.vod_threshold,
-    )
-
-    if not spikes:
-        log.warning(
-            "No hype spikes found. Check the audio track or lower --vod-threshold."
+    try:
+        video_path = download_video(
+            args.url, config.TMP_DIR / "downloads", info.video_id, info.duration
         )
-        provider.cleanup()
-        return 0
+    except VideoSourceError as exc:
+        print(f"\n❌ {exc}", file=sys.stderr)
+        return 1
 
-    log.info("Submitting %d clip jobs…", len(spikes))
-    for spike_time in spikes:
-        clip_maker.on_spike(spike_time)
-
-    # Wait for all clips to finish
-    print(f"\nProcessing {len(spikes)} clip(s)… (this may take a while)")
-    clip_maker.shutdown()
-
-    log.info(
-        "VOD complete. Clips made: %d, failed: %d.",
-        clip_maker.clips_made, clip_maker.clips_failed,
-    )
+    media = probe_media(video_path)
+    if media is None or not media.has_video or media.duration <= 0:
+        print("\n❌ Unable to read the downloaded video (no video stream or unknown duration).",
+              file=sys.stderr)
+        return 1
+    duration = media.duration
+    if info.duration and abs(info.duration - duration) > 5:
+        log.warning(
+            "Downloaded duration %.1fs differs from YouTube's %.1fs; "
+            "timestamps are validated against the downloaded file.",
+            duration, info.duration,
+        )
     print(
-        f"\nDone! "
-        f"{clip_maker.clips_made} clip(s) saved to {config.CLIPS_DIR}"
+        f"  Source: {video_path.name} | {media.width}x{media.height} "
+        f"{media.video_codec}/{media.audio_codec or 'no audio'} | "
+        f"{format_timestamp(duration)}"
     )
 
-    # Clean up segments
-    provider.cleanup()
-    return 0
+    if manual:
+        try:
+            ranges = [
+                validate_range(s, e, duration, config.MANUAL_CLIP_MIN_DURATION)
+                for s, e in manual
+            ]
+        except TimestampError as exc:
+            print(f"\n❌ Invalid clip timestamps: {exc}", file=sys.stderr)
+            return 2
+        min_duration = config.MANUAL_CLIP_MIN_DURATION
+        print(f"\nManual clip(s):")
+        _print_ranges(ranges)
+    else:
+        if not media.has_audio:
+            print(
+                "\n❌ No audio stream found — automatic hype detection needs audio.\n"
+                "   Use --start/--end (manual clipping) instead.",
+                file=sys.stderr,
+            )
+            return 1
+        before, after = _hype_window(args)
+        spikes = VODHypeDetector().find_spikes(
+            video_path=video_path,
+            base_wall_time=0.0,
+            max_clips=args.max_clips,
+            threshold_db=args.vod_threshold,
+            clip_duration=before + after,
+            duration=duration,
+        )
+        if not spikes:
+            print("\n⚠️  No hype moments found. Try a lower --vod-threshold, "
+                  "or clip manually with --start/--end.")
+            return 0
+        ranges = [build_hype_range(t, before, after, duration) for t in spikes]
+        min_duration = min(float(config.CLIP_MIN_DURATION), duration)
+        print(f"\nDetected {len(ranges)} hype moment(s):")
+        _print_ranges(ranges)
+        if args.detect_only:
+            clips = " ".join(f"--clip {r.label()}" for r in ranges)
+            print(f"\nGenerate (or edit) these clips with:\n  python clipper.py {args.url} {clips}")
+            return 0
+        if args.review:
+            ranges = _review_ranges(ranges, duration)
+            if not ranges:
+                print("No clips selected.")
+                return 0
+
+    print(f"\nGenerating {len(ranges)} clip(s)… (Ctrl+C to cancel)")
+    results = _render_ranges(args, info, video_path, ranges, min_duration)
+
+    # Offer to retry failures interactively.
+    for _attempt in range(3):
+        failed = [r for r in results if not r.ok]
+        if not failed or not sys.stdin.isatty():
+            break
+        answer = input(f"\nRetry {len(failed)} failed clip(s)? [y/N] ").strip().lower()
+        if answer not in ("y", "yes"):
+            break
+        retried = _render_ranges(
+            args, info, video_path,
+            [ClipRange(r.start, r.end, r.hype_time) for r in failed],
+            min_duration,
+        )
+        by_index = {r.index: new for r, new in zip(failed, retried)}
+        results = [
+            _reindexed(by_index[r.index], r.index) if r.index in by_index else r
+            for r in results
+        ]
+
+    _summarise(args, results)
+    return 0 if all(r.ok for r in results) else 1
 
 
-def _get_local_duration(video_path: Path) -> float:
-    """Probe duration of a local file."""
-    from video_processor import _probe_duration
-    return _probe_duration(video_path)
-
+def _reindexed(result: ClipResult, index: int) -> ClipResult:
+    result.index = index
+    return result
 
 # ---------------------------------------------------------------------------
 # Main
@@ -544,57 +812,79 @@ def main() -> int:
     if not _check_dependencies():
         return 1
 
+    # Validate manual timestamps before doing any network work.
+    try:
+        manual = _manual_ranges(args)
+        if not manual:
+            _hype_window(args)
+    except TimestampError as exc:
+        print(f"❌ Invalid clip timestamps: {exc}", file=sys.stderr)
+        return 2
+
     # Platform detection
     platform = args.platform or _detect_platform(args.url)
 
-    # For YouTube: normalize URL and probe video metadata to decide mode
-    if platform == "youtube":
-        url = normalize_youtube_url(args.url)
-        if url != args.url:
-            log.info("Normalized URL: %s → %s", args.url, url)
-            args.url = url
-
-        print(f"Probing video: {args.url} …")
-        info = probe_video(args.url)
-
-        if info is None:
-            # probe_video already logged the specific error
-            print(
-                "\n❌ Could not retrieve video info. "
-                "The video may be private, age-restricted, region-locked, or deleted.",
-                file=sys.stderr,
-            )
-            return 1
-
-        if info.is_upcoming:
-            print(
-                f"\n❌ This video is scheduled but not yet live: {info.title}",
-                file=sys.stderr,
-            )
-            return 1
-
-        log.info(
-            "Video: %r | type=%s | duration=%.0fs",
-            info.title, info.source_type, info.duration,
-        )
-
-        if info.is_live:
-            # Currently live → use original live-stream pipeline
-            print(f"  → Detected: LIVE STREAM — switching to live mode.\n")
-            return _run_live(args, platform)
-        else:
-            # Archived stream or regular published video → VOD pipeline
-            type_label = {
-                "archived": "ARCHIVED LIVESTREAM",
-                "video":    "REGULAR VIDEO",
-            }.get(info.source_type, info.source_type.upper())
-            print(f"  → Detected: {type_label} — processing as VOD.\n")
-            return _run_vod(args, info)
-
-    else:
+    if platform != "youtube":
+        if manual or args.info:
+            print("❌ Manual clipping and --info are only supported for YouTube videos.",
+                  file=sys.stderr)
+            return 2
         # Twitch — always live stream mode
         return _run_live(args, platform)
 
+    # For YouTube: normalize URL and probe video metadata to decide mode
+    url = normalize_youtube_url(args.url)
+    if url != args.url:
+        log.info("Normalized URL: %s → %s", args.url, url)
+        args.url = url
+
+    print(f"Loading video info: {args.url} …")
+    try:
+        info = probe_video_detailed(args.url)
+    except VideoSourceError as exc:
+        print(f"\n❌ Unable to retrieve video information: {exc}", file=sys.stderr)
+        return 1
+
+    type_label = {
+        "live":     "LIVE STREAM",
+        "archived": "COMPLETED LIVESTREAM (replay)",
+        "video":    "REGULAR VIDEO",
+    }.get(info.source_type, info.source_type.upper())
+    if info.is_upcoming:
+        type_label = "UPCOMING / SCHEDULED"
+    print(
+        f"  Title    : {info.title}\n"
+        f"  Channel  : {info.uploader}\n"
+        f"  Type     : {type_label}\n"
+        f"  Duration : {format_timestamp(info.duration) if info.duration else 'unknown (live)'}"
+    )
+    if args.info:
+        return 0
+
+    if info.is_upcoming:
+        print(f"\n❌ This video is scheduled but not yet live: {info.title}", file=sys.stderr)
+        return 1
+
+    if info.is_live:
+        if manual:
+            print(
+                "\n❌ Manual timestamp clipping needs a finished video; this stream is "
+                "still live. Run it again on the replay once the stream ends.",
+                file=sys.stderr,
+            )
+            return 2
+        print(f"  → Live stream — switching to live mode.\n")
+        return _run_live(args, platform)
+
+    print(f"  → Processing as {'manual clip' if manual else 'hype detection'} on the full video.\n")
+    try:
+        return _run_vod(args, info, manual)
+    except KeyboardInterrupt:
+        print("\nCancelled.", file=sys.stderr)
+        return 130
+    except TimestampError as exc:
+        print(f"\n❌ Invalid clip timestamps: {exc}", file=sys.stderr)
+        return 2
 
 if __name__ == "__main__":
     sys.exit(main())

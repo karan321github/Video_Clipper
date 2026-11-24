@@ -10,6 +10,13 @@ SEGMENT_DURATION: int = 30          # seconds per .ts segment written by ffmpeg
 # Keep 12 for safety (12 × 30 = 360 s).
 SEGMENT_BUFFER_KEEP: int = 12       # how many past segments to keep on disk
 STREAM_QUALITY: str = "bestvideo+bestaudio/best"  # Separate live tracks, with muxed fallback
+# Regular videos / replays: output is 1080p, so don't download 4K/8K sources.
+# Any codec (H.264, VP9, AV1, AAC, Opus…) is accepted — clips are re-encoded.
+VOD_FORMAT: str = "bv*[height<=1080]+ba/b[height<=1080]/bv*+ba/b"
+# Among allowed formats prefer ≤1080p, then H.264/AAC: they decode far faster
+# than AV1/VP9 (clips are re-encoded either way, so quality is unaffected).
+VOD_FORMAT_SORT: str = "res:1080,vcodec:h264,acodec:aac"
+VOD_DOWNLOAD_TIMEOUT: int = 3 * 3600   # seconds
 
 # ── Analysis cadence ──────────────────────────────────────────────────────
 ANALYSIS_INTERVAL: float = 10.0     # seconds between hype checks
@@ -18,6 +25,11 @@ ANALYSIS_INTERVAL: float = 10.0     # seconds between hype checks
 CLIP_DURATION: int = 240            # max length of the output clip (seconds) — configurable
 CLIP_MIN_DURATION: int = 15         # minimum clip length (seconds)
 CLIP_LOOKBACK: int = 20             # seconds before spike where clip starts
+MANUAL_CLIP_MIN_DURATION: float = 1.0  # shortest clip allowed in manual mode
+# Generated clips must be within this many seconds of the requested length.
+CLIP_DURATION_TOLERANCE: float = 1.5
+# Refuse to start downloads/encodes when less free space than this remains.
+MIN_FREE_DISK_MB: int = 500
 
 # Output: 16:9 horizontal (YouTube-ready)
 OUTPUT_WIDTH:  int = 1920
@@ -123,3 +135,14 @@ def _find_bin(name: str) -> str:
 FFMPEG_BIN  = _find_bin("ffmpeg")
 FFPROBE_BIN = _find_bin("ffprobe")
 YTDLP_BIN   = _find_bin("yt-dlp")
+DENO_BIN    = _find_bin("deno")     # JS runtime yt-dlp uses for YouTube
+
+
+def ytdlp_js_runtime_args(url: str) -> list[str]:
+    """`--js-runtimes` arguments for YouTube URLs, only if Deno is installed."""
+    lowered = url.lower()
+    if "youtube.com" not in lowered and "youtu.be" not in lowered:
+        return []
+    if pathlib.Path(DENO_BIN).is_absolute() and pathlib.Path(DENO_BIN).exists():
+        return ["--js-runtimes", f"deno:{DENO_BIN}"]
+    return []

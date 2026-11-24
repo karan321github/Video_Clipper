@@ -1,21 +1,22 @@
-"""
+﻿"""
 video_processor.py — GTAClipper Regular Video Processor
 =========================================================
-Handles non-live YouTube videos (published VODs, archived streams, podcasts).
+Handles non-live YouTube videos (published VODs, completed livestream
+replays, podcasts).
 
 Workflow
 --------
-1. Probe the URL with yt-dlp to detect video type (live / archived / regular).
-2. Download the full video (or use an already-downloaded file) using yt-dlp.
-3. Split the downloaded video into SEGMENT_DURATION-second virtual segments.
-4. Run the same HypeDetector → ClipMaker pipeline used for live streams.
-5. After all clips are produced, clean up.
+1. Probe the URL with yt-dlp to detect the video type
+   (live / upcoming / post-live / archived replay / regular video).
+2. Download the source once (≤1080p, any codec) — or reuse a validated
+   cached copy — merging separate audio/video streams into one file.
+3. Scan the audio track in a single ffmpeg pass (VODHypeDetector) to find
+   hype moments as offsets on the source timeline.
+4. ClipMaker cuts each [start, end] range straight from the source file.
 
-This module is intentionally designed to reuse existing components:
-  • yt-dlp for download & metadata
-  • ffmpeg for segmentation & encoding (via ClipMaker)
-  • HypeDetector for highlight identification
-  • ClipMaker for clip rendering
+Note: earlier versions stream-copied the download into MPEG-TS segments
+(OfflineSegmentProvider). That silently dropped VP9/AV1 video, so the VOD
+pipeline no longer uses it; the class is kept for compatibility.
 """
 
 from __future__ import annotations
@@ -24,7 +25,9 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -32,11 +35,15 @@ from pathlib import Path
 from typing import Optional
 
 import config
+from media_tools import probe_media, run_process, format_cmd
 from recorder import SegmentInfo, StreamRecorder
-from clip_maker import ClipMaker
 from chat_reader import ChatReader, ChatMessage
 
 log = logging.getLogger(__name__)
+
+
+class VideoSourceError(Exception):
+    """A video could not be probed or downloaded; message is user-readable."""
 
 
 # ---------------------------------------------------------------------------
@@ -55,64 +62,85 @@ class VideoInfo:
     is_upcoming: bool        = False        # scheduled but not started
     uploader:    str         = ""
     source_type: str         = "unknown"   # "live" | "archived" | "video"
+    live_status: str         = ""          # raw yt-dlp live_status
 
 
-def probe_video(url: str) -> Optional[VideoInfo]:
+# (substring in yt-dlp stderr, lower-cased) → user-readable reason
+_YTDLP_ERRORS: list[tuple[str, str]] = [
+    ("private video", "The video is private."),
+    ("confirm your age", "The video is age-restricted and requires sign-in."),
+    ("age-restricted", "The video is age-restricted and requires sign-in."),
+    ("not a bot", "YouTube requires sign-in to confirm you're not a bot (try again later or use cookies)."),
+    ("members-only", "The video is members-only."),
+    ("join this channel", "The video is members-only."),
+    ("this live event will begin", "The livestream has not started yet."),
+    ("premieres in", "The video is a premiere that has not started yet."),
+    ("not available in your country", "The video is region-restricted."),
+    ("blocked it in your country", "The video is region-restricted."),
+    ("copyright", "The video was removed for copyright reasons."),
+    ("has been removed", "The video has been removed."),
+    ("video unavailable", "The video is unavailable."),
+    ("video is unavailable", "The video is unavailable."),
+    ("is not available", "The video is unavailable."),
+    ("unsupported url", "This URL is not supported."),
+    ("requested format is not available", "No downloadable format is available for this video."),
+    ("no space left", "Insufficient disk space for the download."),
+    ("unable to download", "Network error while contacting YouTube."),
+    ("timed out", "Network timeout while contacting YouTube."),
+]
+
+
+def describe_ytdlp_error(stderr: str) -> str:
+    """Translate yt-dlp stderr into a short user-readable reason."""
+    lowered = stderr.lower()
+    for needle, reason in _YTDLP_ERRORS:
+        if needle in lowered:
+            return reason
+    errors = [l for l in stderr.splitlines() if l.startswith("ERROR")]
+    return (errors[-1] if errors else "yt-dlp failed.")[:300]
+
+
+def probe_video_detailed(url: str) -> VideoInfo:
     """
     Run yt-dlp --dump-json to retrieve video metadata without downloading.
-
-    Returns a VideoInfo on success, None on error (private / unavailable / etc.).
+    Raises VideoSourceError with a user-readable reason on failure.
     """
     log.info("Probing video metadata: %s", url)
     cmd = [
         config.YTDLP_BIN,
+        *config.ytdlp_js_runtime_args(url),
         "--dump-json",
         "--no-download",
         "--no-playlist",
+        url,
     ]
-    # YouTube requires the deno JS runtime for certain requests
-    if "youtube.com" in url.lower() or "youtu.be" in url.lower():
-        cmd += ["--js-runtimes", "deno"]
-    cmd.append(url)
-
     try:
         result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=60,
+            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=90,
         )
     except FileNotFoundError:
-        log.error("yt-dlp not found. Install with: pip install yt-dlp")
-        return None
+        raise VideoSourceError("yt-dlp not found. Install with: pip install yt-dlp") from None
     except subprocess.TimeoutExpired:
-        log.error("yt-dlp metadata probe timed out for %s", url)
-        return None
+        raise VideoSourceError("Timed out retrieving video information.") from None
 
     if result.returncode != 0:
         stderr = result.stderr.strip()
-        # Provide meaningful diagnostics for common failure modes
-        if "Private video" in stderr:
-            log.error("Video is private: %s", url)
-        elif "age-restricted" in stderr.lower():
-            log.error("Video is age-restricted: %s", url)
-        elif "not available" in stderr.lower() or "unavailable" in stderr.lower():
-            log.error("Video is unavailable: %s", url)
-        elif "region" in stderr.lower():
-            log.error("Video is region-restricted: %s", url)
-        else:
-            log.error("yt-dlp metadata probe failed:\n%s", stderr[:1000])
-        return None
+        reason = describe_ytdlp_error(stderr)
+        log.error("yt-dlp metadata probe failed (%s):\n%s", reason, stderr[-1500:])
+        raise VideoSourceError(reason)
 
     try:
         meta = json.loads(result.stdout)
     except json.JSONDecodeError as exc:
-        log.error("Could not parse yt-dlp JSON output: %s", exc)
-        return None
+        raise VideoSourceError(f"Could not parse yt-dlp output: {exc}") from None
 
-    is_live     = bool(meta.get("is_live", False))
-    was_live    = bool(meta.get("was_live", False))
-    is_upcoming = bool(meta.get("is_upcoming", False))
+    live_status = str(meta.get("live_status") or "")
+    is_live     = bool(meta.get("is_live", False)) or live_status == "is_live"
+    is_upcoming = bool(meta.get("is_upcoming", False)) or live_status == "is_upcoming"
+    was_live    = (
+        bool(meta.get("was_live", False))
+        or live_status in ("was_live", "post_live")
+    )
     duration    = float(meta.get("duration") or 0.0)
 
     if is_live:
@@ -132,14 +160,28 @@ def probe_video(url: str) -> Optional[VideoInfo]:
         is_upcoming=is_upcoming,
         uploader=meta.get("uploader", ""),
         source_type=source_type,
+        live_status=live_status,
     )
 
     log.info(
-        "Video info — id=%s | type=%s | duration=%.0fs | title=%r",
-        info.video_id, info.source_type, info.duration, info.title,
+        "Video info — id=%s | type=%s | live_status=%s | duration=%.0fs | title=%r",
+        info.video_id, info.source_type, live_status or "?", info.duration, info.title,
     )
+    if live_status == "post_live":
+        log.warning(
+            "This stream just ended and YouTube is still processing the replay; "
+            "the downloadable portion may be incomplete."
+        )
     return info
 
+
+def probe_video(url: str) -> Optional[VideoInfo]:
+    """Like probe_video_detailed() but returns None on failure."""
+    try:
+        return probe_video_detailed(url)
+    except VideoSourceError as exc:
+        log.error("Could not retrieve video info for %s: %s", url, exc)
+        return None
 
 # ---------------------------------------------------------------------------
 # Normalize YouTube URL variants
@@ -324,10 +366,11 @@ class OfflineSegmentProvider:
 class VODHypeDetector:
     """
     Analyses a fully-downloaded VOD file to find interesting segments using
-    audio loudness peaks and scene changes — no live chat required.
+    audio loudness peaks — no live chat required.
 
-    Returns a list of wall_start times (seconds offset into the video) where
-    hype spikes are detected, spaced by CLIP_COOLDOWN_SECONDS.
+    Returns `base_wall_time + offset` for each detected moment, where offset
+    is the start (in seconds) of the loud ANALYSIS_INTERVAL window on the
+    source timeline. Pass base_wall_time=0 to get plain video offsets.
     """
 
     def find_spikes(
@@ -336,26 +379,26 @@ class VODHypeDetector:
         base_wall_time: float,
         max_clips: int = 20,
         threshold_db: float | None = None,
+        clip_duration: float | None = None,
+        duration: float | None = None,
     ) -> list[float]:
         """
         Analyse the VOD for loud audio segments.
-        Returns a list of absolute wall-clock spike times.
+        Moments are spaced at least one clip length apart so clips never
+        overlap. Videos shorter than the clip length yield (at most) one
+        moment; the caller shrinks the clip to the video.
         """
         if max_clips <= 0:
             log.warning("VOD max_clips must be greater than zero.")
             return []
 
-        duration = _probe_duration(video_path)
+        if not duration or duration <= 0:
+            duration = _probe_duration(video_path)
         if duration <= 0:
-            log.warning("Could not determine video duration; using whole video.")
-            duration = 3600.0
-        if duration < config.CLIP_DURATION:
-            log.warning(
-                "VOD is only %.1f s; cannot create a %d-second clip.",
-                duration,
-                config.CLIP_DURATION,
-            )
+            log.error("Could not determine the video duration; cannot analyse %s.", video_path)
             return []
+        clip_duration = clip_duration or config.CLIP_DURATION
+        effective_clip = min(clip_duration, duration)
 
         log.info("Analysing %.0f-second VOD for hype moments…", duration)
 
@@ -365,12 +408,15 @@ class VODHypeDetector:
             if threshold_db is None
             else threshold_db
         )
-        samples: list[tuple[float, float]] = []
-        t = 0.0
-        while t < duration:
-            rms = self._measure_loudness_at(video_path, t, interval)
-            samples.append((t, rms))
-            t += interval
+        samples = self._measure_all_windows(video_path, duration, interval)
+        if samples is None:
+            log.info("Falling back to per-window loudness measurement.")
+            samples = []
+            t = 0.0
+            while t < duration:
+                rms = self._measure_loudness_at(video_path, t, min(interval, duration - t))
+                samples.append((t, rms))
+                t += interval
 
         valid = [(offset, rms) for offset, rms in samples if rms > -90.0]
         if not valid:
@@ -398,7 +444,7 @@ class VODHypeDetector:
             candidates = valid
 
         # A cooldown shorter than a clip would produce overlapping outputs.
-        clip_spacing = max(config.CLIP_COOLDOWN_SECONDS, config.CLIP_DURATION)
+        clip_spacing = max(config.CLIP_COOLDOWN_SECONDS, effective_clip)
         selected: list[tuple[float, float]] = []
         for candidate in sorted(candidates, key=lambda sample: sample[1], reverse=True):
             if all(
@@ -421,6 +467,62 @@ class VODHypeDetector:
         )
         log.info("Found %d spike(s) in VOD.", len(spike_times))
         return spike_times
+
+    def _measure_all_windows(
+        self, path: Path, duration: float, interval: float
+    ) -> Optional[list[tuple[float, float]]]:
+        """
+        Measure the RMS level of every `interval`-second window in a single
+        decode pass (much faster than one ffmpeg process per window).
+        Returns [(offset, rms_db)], or None so the caller can fall back.
+        """
+        sample_rate = 16000
+        window = max(1, int(interval * sample_rate))
+        cmd = [
+            config.FFMPEG_BIN, "-hide_banner", "-nostats",
+            "-i", str(path),
+            "-map", "0:a:0", "-vn",
+            "-af",
+            f"aresample={sample_rate},asetnsamples=n={window}:p=0,"
+            "astats=metadata=1:reset=1,"
+            "ametadata=mode=print:key=lavfi.astats.Overall.RMS_level:file=-",
+            "-f", "null", "-",
+        ]
+        samples: list[tuple[float, float]] = []
+        pending: list[float] = []
+        last_logged = [time.monotonic()]
+
+        def on_line(line: str) -> None:
+            if line.startswith("frame:"):
+                m = re.search(r"pts_time:([\d.]+)", line)
+                if m:
+                    pending.append(float(m.group(1)))
+                    if time.monotonic() - last_logged[0] > 10:
+                        last_logged[0] = time.monotonic()
+                        log.info("Hype scan: %.0f%%", min(100.0, 100 * pending[-1] / duration))
+            elif line.startswith("lavfi.astats.Overall.RMS_level=") and pending:
+                raw = line.split("=", 1)[1].strip()
+                try:
+                    value = float(raw)
+                except ValueError:
+                    value = -99.0
+                if value != value or value < -200:   # nan / -inf (digital silence)
+                    value = -99.0
+                samples.append((round(pending.pop(), 3), value))
+
+        try:
+            res = run_process(cmd, timeout=max(600, duration * 0.5), on_stdout=on_line)
+        except FileNotFoundError:
+            log.error("ffmpeg not found while measuring VOD loudness.")
+            return None
+        if res.returncode != 0 or not samples:
+            log.warning(
+                "Single-pass loudness scan failed (exit %s): %s",
+                res.returncode, res.last_error_line(),
+            )
+            return None
+        log.info("Hype scan: measured %d windows.", len(samples))
+        return samples
 
     def _measure_loudness_at(
         self, path: Path, offset: float, duration: float
@@ -467,59 +569,131 @@ class VODHypeDetector:
 # Download helper
 # ---------------------------------------------------------------------------
 
-def download_video(url: str, out_dir: Path, video_id: str) -> Optional[Path]:
-    """
-    Download a YouTube video using yt-dlp.
+def _validate_cached_download(
+    path: Path, expected_duration: float, require_audio: bool = True
+) -> Optional[str]:
+    """Return None if `path` is a complete, usable download, else why not."""
+    media = probe_media(path)
+    if media is None:
+        return "unreadable"
+    if not media.has_video:
+        return "no video stream"
+    if require_audio and not media.has_audio:
+        return "no audio stream"
+    if expected_duration > 0 and media.duration + 5 < expected_duration:
+        return f"truncated ({media.duration:.0f}s of {expected_duration:.0f}s)"
+    return None
 
-    Returns the path to the downloaded file, or None on failure.
-    Reuses a cached file only if it contains a video stream.
+
+def download_video(
+    url: str,
+    out_dir: Path,
+    video_id: str,
+    expected_duration: float = 0.0,
+) -> Path:
+    """
+    Download a YouTube video (≤1080p, separate audio+video merged into one
+    file) using yt-dlp and return its path. A previous complete download
+    of the same video is reused.
+
+    The download runs in a private temp directory and is moved into the
+    cache atomically, so concurrent jobs never see a partial file and an
+    interrupted download (e.g. a leftover video-only `ID.f399.mp4`) is
+    never mistaken for a finished one.
+
+    Raises VideoSourceError with a user-readable reason on failure.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
+    safe_id = re.sub(r"[^\w\-]", "_", video_id) or "video"
 
-    # Check if already downloaded (avoid re-downloading), but ignore audio-only
-    # leftovers from interrupted or older download attempts.
-    for existing in out_dir.glob(f"*{video_id}*"):
-        if existing.suffix in (".mp4", ".mkv", ".webm"):
-            if _has_video_stream(existing):
-                log.info("Using already-downloaded file: %s", existing)
-                return existing
-            log.warning("Ignoring cached file without video: %s", existing)
+    for ext in (".mp4", ".mkv", ".webm"):
+        cached = out_dir / f"{safe_id}{ext}"
+        if cached.exists():
+            problem = _validate_cached_download(cached, expected_duration)
+            if problem is None:
+                log.info("Reusing downloaded file: %s", cached)
+                return cached
+            log.warning("Ignoring cached file %s (%s).", cached.name, problem)
 
-    out_tmpl = str(out_dir / "%(id)s.%(ext)s")
-    cmd = [
-        config.YTDLP_BIN,
-        "--no-playlist",
-        "-f", config.STREAM_QUALITY,
-        "-o", out_tmpl,
-        "--merge-output-format", "mp4",
-        "--no-part",        # don't leave .part files on failure
-    ]
-    if "youtube.com" in url.lower() or "youtu.be" in url.lower():
-        cmd += ["--js-runtimes", "deno"]
-    cmd.append(url)
+    free_mb = shutil.disk_usage(out_dir).free / (1024 * 1024)
+    if free_mb < config.MIN_FREE_DISK_MB:
+        raise VideoSourceError(
+            f"Insufficient disk space: only {free_mb:.0f} MB free in {out_dir}."
+        )
 
-    log.info("Downloading video: %s", url)
+    job_dir = Path(tempfile.mkdtemp(prefix=f".dl_{safe_id}_", dir=out_dir))
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
-        if result.returncode != 0:
-            stderr = result.stderr.strip()
-            log.error("yt-dlp download failed:\n%s", stderr[:2000])
-            return None
-    except subprocess.TimeoutExpired:
-        log.error("yt-dlp download timed out.")
-        return None
+        cmd = [
+            config.YTDLP_BIN,
+            *config.ytdlp_js_runtime_args(url),
+            "--no-playlist",
+            "-f", config.VOD_FORMAT,
+            "-S", config.VOD_FORMAT_SORT,
+            "--merge-output-format", "mp4/mkv",
+            "-o", str(job_dir / f"{safe_id}.%(ext)s"),
+            "--print", "after_move:filepath",
+            "--progress", "--newline",
+            url,
+        ]
+        log.info("Downloading video: %s", url)
+        log.debug("yt-dlp command: %s", format_cmd(cmd))
 
-    # Locate the downloaded file
-    for f in out_dir.glob(f"{video_id}.*"):
-        if f.suffix in (".mp4", ".mkv", ".webm"):
-            if not _has_video_stream(f):
-                log.error("Downloaded media has no video stream: %s", f)
-                continue
-            log.info("Downloaded: %s (%.1f MB)", f.name, f.stat().st_size / 1e6)
-            return f
+        last_pct = [-10.0]
 
-    log.error("Downloaded file not found in %s", out_dir)
-    return None
+        def on_line(line: str) -> None:
+            m = re.search(r"\[download\]\s+([\d.]+)%", line)
+            if m:
+                pct = float(m.group(1))
+                if pct >= last_pct[0] + 10 or pct >= 100:
+                    last_pct[0] = pct
+                    log.info("Download: %s", line.split("]", 1)[1].strip())
+
+        try:
+            res = run_process(
+                cmd, timeout=config.VOD_DOWNLOAD_TIMEOUT, on_stdout=on_line, on_stderr=on_line,
+            )
+        except FileNotFoundError:
+            raise VideoSourceError("yt-dlp not found. Install with: pip install yt-dlp") from None
+        if res.timed_out:
+            raise VideoSourceError(
+                f"Video download timed out after {config.VOD_DOWNLOAD_TIMEOUT} s."
+            )
+        if res.returncode != 0:
+            reason = describe_ytdlp_error(res.stderr)
+            log.error("yt-dlp download failed (exit %d):\n%s", res.returncode, res.stderr[-2000:])
+            raise VideoSourceError(f"Video download failed: {reason}")
+
+        candidates = [Path(l.strip()) for l in res.stdout_tail if l.strip()]
+        candidates = [p for p in candidates if p.exists()]
+        if not candidates:
+            candidates = [
+                p for p in job_dir.glob(f"{safe_id}.*")
+                if p.suffix in (".mp4", ".mkv", ".webm")
+            ]
+        if not candidates:
+            raise VideoSourceError("Video download failed: yt-dlp produced no file.")
+        downloaded = candidates[-1]
+
+        problem = _validate_cached_download(downloaded, expected_duration, require_audio=False)
+        if problem and problem.startswith("truncated"):
+            log.warning("Downloaded file looks %s; continuing with what is available.", problem)
+        elif problem:
+            raise VideoSourceError(f"Downloaded media is unusable: {problem}.")
+
+        final = out_dir / f"{safe_id}{downloaded.suffix}"
+        try:
+            os.replace(downloaded, final)
+        except OSError as exc:
+            if final.exists() and _validate_cached_download(
+                final, expected_duration, require_audio=False
+            ) is None:
+                log.info("Another job finished the same download first; reusing it.")
+            else:
+                raise VideoSourceError(f"Could not store the download: {exc}") from None
+        log.info("Downloaded: %s (%.1f MB)", final.name, final.stat().st_size / 1e6)
+        return final
+    finally:
+        shutil.rmtree(job_dir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------

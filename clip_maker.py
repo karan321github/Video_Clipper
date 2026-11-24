@@ -1,85 +1,260 @@
 """
 clip_maker.py — GTAClipper Clip Maker
 =======================================
-Triggered by HypeDetector when a hype spike is detected.
-Pipeline for each clip:
-  1. Gather the .ts segments that cover [spike_time - CLIP_LOOKBACK,
-     spike_time - CLIP_LOOKBACK + CLIP_DURATION].
-  2. Concatenate segments into a single temp raw clip (ffmpeg concat demuxer).
-  3. Render 16:9 horizontal (1920×1080) output:
-       • If source is already 16:9: scale directly.
-       • Otherwise: scale source to fit, fill empty bars with a blurred
-         & scaled copy (OUTPUT_FILL_MODE="blur") or black bars.
-       • If a streamer cam overlay is provided, composite it over the
-         bottom-right corner of the frame.
-  4. Transcribe audio with faster-whisper → write SRT subtitle file.
-  5. Burn subtitles and title drawtext overlay in a single ffmpeg pass.
-  6. Save final clip to clips/<timestamp>_<title>.mp4.
-  7. Clean up temp files.
+Renders clips from either:
 
-Up to MAX_CONCURRENT_CLIPS clips are processed simultaneously via a
-thread pool so that back-to-back spikes don't block each other.
+  • a local source file (regular videos / livestream replays / manual
+    timestamps): `submit_source_clip()` / `render_source_clip()`
+  • the live recorder's rolling .ts segments (live streams): `on_spike()`
+
+Both paths share one FFmpeg render pipeline:
+  1. Validate the requested [start, end] range against the source duration.
+  2. Check that the source has a video stream (audio is optional).
+  3. Create a unique per-job temp directory (no collisions between jobs).
+  4. Optionally transcribe the clip's audio with faster-whisper → SRT.
+  5. Encode in a single ffmpeg pass using *input* seeking (-ss before -i)
+     with a full re-encode, which gives frame-accurate cuts, keeps audio
+     and video in sync, and works with any input codec (H.264, VP9, AV1,
+     AAC, Opus, 10-bit…). Output: 1920×1080 H.264 (yuv420p) + AAC MP4.
+  6. Verify the output exists, is non-empty, has the right streams and
+     duration, and decodes without errors — only then publish it to
+     clips/ with a unique filename.
+  7. Clean up the job's temp directory.
+
+Failures raise ClipError internally and are reported as a ClipResult with
+the stage and a user-readable message; failed clips are never counted as
+successful.
 """
 
 from __future__ import annotations
 
-import logging
+import importlib.util
 import json
+import logging
 import os
 import re
+import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Callable, Optional, Sequence
 
 import config
-from recorder import SegmentInfo, StreamRecorder
 from chat_reader import ChatReader
+from media_tools import MediaInfo, format_cmd, probe_media, run_ffmpeg
+from recorder import SegmentInfo, StreamRecorder
+from timestamps import (
+    ClipRange,
+    TimestampError,
+    filename_timestamp,
+    format_timestamp,
+    validate_range,
+)
 from title_generator import generate_title
 
 log = logging.getLogger(__name__)
 
 MAX_CONCURRENT_CLIPS = 2    # max parallel clip-making threads
 
+# User-facing message prefix for each pipeline stage.
+STAGE_MESSAGES = {
+    "validate": "Invalid clip timestamps",
+    "source": "Unable to read source media",
+    "streams": "Unsupported source media",
+    "segments": "Recorded footage unavailable",
+    "disk": "Insufficient disk space",
+    "encode": "FFmpeg processing failed",
+    "timeout": "FFmpeg processing timed out",
+    "cancelled": "Clip generation cancelled",
+    "verify": "Generated video failed validation",
+    "publish": "Could not save the generated clip",
+    "internal": "Unexpected error",
+}
+
+
+class ClipError(Exception):
+    """A clip failed at a specific pipeline stage."""
+
+    def __init__(self, stage: str, message: str, detail: str = ""):
+        super().__init__(message)
+        self.stage = stage
+        self.message = message
+        self.detail = detail
+
+    def user_message(self) -> str:
+        prefix = STAGE_MESSAGES.get(self.stage, "Clip failed")
+        return f"{prefix}: {self.message}"
+
+
+@dataclass
+class ClipResult:
+    index: int
+    start: float
+    end: float
+    hype_time: Optional[float] = None
+    status: str = "pending"            # pending | running | ok | failed
+    path: Optional[Path] = None
+    error: str = ""
+    stage: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.status == "ok"
+
+    def label(self) -> str:
+        return f"{format_timestamp(self.start)}-{format_timestamp(self.end)}"
+
+
+ProgressCallback = Callable[[ClipResult, str, float], None]
+
+
+def captions_available() -> bool:
+    return importlib.util.find_spec("faster_whisper") is not None
+
 
 class ClipMaker:
     """
-    Receives spike events and produces horizontal 16:9 MP4 clips with
-    burned-in captions and a title overlay.
+    Receives spike events / clip requests and produces horizontal 16:9 MP4
+    clips with optional burned-in captions and a title overlay.
     """
 
-    def __init__(self, recorder: StreamRecorder, chat_reader: ChatReader):
+    def __init__(
+        self,
+        recorder: Optional[StreamRecorder],
+        chat_reader: Optional[ChatReader],
+        captions: bool = True,
+        max_workers: int = MAX_CONCURRENT_CLIPS,
+    ):
         self.recorder    = recorder
         self.chat_reader = chat_reader
         self._executor   = ThreadPoolExecutor(
-            max_workers=MAX_CONCURRENT_CLIPS, thread_name_prefix="ClipMaker"
+            max_workers=max_workers, thread_name_prefix="ClipMaker"
         )
         self._whisper_lock = threading.Lock()   # one transcription at a time
         self._whisper_model = None              # lazy-loaded
+        self._captions = captions and captions_available()
+        if captions and not self._captions:
+            log.warning("faster-whisper is not installed — clips will have no captions.")
+
+        self._stats_lock = threading.Lock()
+        self._media_cache: dict[Path, MediaInfo] = {}
+        self._media_lock = threading.Lock()
+        self._stop_event = threading.Event()     # cancels running ffmpeg jobs
+        self._live_stop = threading.Event()      # live: stop waiting for footage
+        self._live_counter = 0
 
         # Stats
         self.clips_made: int = 0
         self.clips_failed: int = 0
 
-        # Ensure output directories exist
         config.CLIPS_DIR.mkdir(parents=True, exist_ok=True)
         config.TMP_DIR.mkdir(parents=True, exist_ok=True)
 
     # ── Public API ──────────────────────────────────────────────────────────
 
     def on_spike(self, spike_time: float) -> None:
-        """Called by HypeDetector. Submits a clip job to the thread pool."""
-        # Snapshot the recent chat messages at spike time
-        recent_chat = self.chat_reader.recent(seconds=30.0)
+        """Called by HypeDetector (live mode). Submits a clip job."""
+        recent_chat = self.chat_reader.recent(seconds=30.0) if self.chat_reader else []
         self._executor.submit(self._make_clip, spike_time, recent_chat)
         log.info("Clip job submitted for spike at %.1f.", spike_time)
 
-    def shutdown(self) -> None:
-        """Wait for all in-progress clips to finish."""
-        self._executor.shutdown(wait=True)
+    def submit_source_clip(
+        self,
+        source: Path,
+        clip_range: ClipRange,
+        *,
+        index: int = 1,
+        title: str = "",
+        video_label: str = "",
+        min_duration: float = config.MANUAL_CLIP_MIN_DURATION,
+        progress: Optional[ProgressCallback] = None,
+    ) -> "Future[ClipResult]":
+        """Queue a clip of `source` between clip_range.start and clip_range.end."""
+        return self._executor.submit(
+            self.render_source_clip,
+            source,
+            clip_range,
+            index=index,
+            title=title,
+            video_label=video_label,
+            min_duration=min_duration,
+            progress=progress,
+        )
+
+    def render_source_clip(
+        self,
+        source: Path,
+        clip_range: ClipRange,
+        *,
+        index: int = 1,
+        title: str = "",
+        video_label: str = "",
+        min_duration: float = config.MANUAL_CLIP_MIN_DURATION,
+        progress: Optional[ProgressCallback] = None,
+    ) -> ClipResult:
+        """Render one clip from a local source file (blocking)."""
+        result = ClipResult(
+            index=index,
+            start=clip_range.start,
+            end=clip_range.end,
+            hype_time=clip_range.hype_time,
+            status="running",
+        )
+        media: Optional[MediaInfo] = None
+        try:
+            media = self._source_media(source)
+            try:
+                validated = validate_range(
+                    clip_range.start, clip_range.end, media.duration, min_duration
+                )
+            except TimestampError as exc:
+                raise ClipError("validate", str(exc)) from None
+            result.start, result.end = validated.start, validated.end
+
+            video_id = _safe_filename(video_label or source.stem)
+            out_name = (
+                f"clip_{video_id}_{filename_timestamp(result.start)}-"
+                f"{filename_timestamp(result.end)}_{uuid.uuid4().hex[:8]}.mp4"
+            )
+            result.path = self._render(
+                source=source,
+                input_args=(),
+                start=result.start,
+                duration=result.end - result.start,
+                has_audio=media.has_audio,
+                source_size=(media.width, media.height),
+                title=title or "Hype Moment",
+                out_path=config.CLIPS_DIR / out_name,
+                result=result,
+                progress=progress,
+            )
+            result.status = "ok"
+            self._count(ok=True)
+            log.info("✅ Clip %d saved: %s", index, result.path)
+        except ClipError as exc:
+            self._fail(result, exc, video_label, media)
+        except Exception as exc:  # pragma: no cover - defensive
+            log.exception("Clip %d crashed", index)
+            self._fail(result, ClipError("internal", str(exc)), video_label, media)
+        if progress:
+            progress(result, result.status, 1.0)
+        return result
+
+    def shutdown(self, cancel: bool = False) -> None:
+        """
+        Wait for queued clips. Live clips still waiting for footage are
+        rendered with what has been recorded. With cancel=True, pending jobs
+        are dropped and running ffmpeg processes are killed.
+        """
+        if cancel:
+            self._stop_event.set()
+        self._live_stop.set()
+        self._executor.shutdown(wait=True, cancel_futures=cancel)
         log.info("ClipMaker: all jobs finished.")
 
     # ── Whisper model (lazy, shared) ────────────────────────────────────────
@@ -88,193 +263,197 @@ class ClipMaker:
         if self._whisper_model is None:
             with self._whisper_lock:
                 if self._whisper_model is None:
-                    try:
-                        from faster_whisper import WhisperModel
-                        log.info(
-                            "Loading faster-whisper model '%s' on %s…",
-                            config.WHISPER_MODEL, config.WHISPER_DEVICE,
-                        )
-                        self._whisper_model = WhisperModel(
-                            config.WHISPER_MODEL,
-                            device=config.WHISPER_DEVICE,
-                            compute_type=config.WHISPER_COMPUTE_TYPE,
-                        )
-                        log.info("Whisper model loaded.")
-                    except ImportError:
-                        log.error(
-                            "faster-whisper not installed. "
-                            "Run: pip install faster-whisper"
-                        )
-                        raise
+                    from faster_whisper import WhisperModel
+                    log.info(
+                        "Loading faster-whisper model '%s' on %s…",
+                        config.WHISPER_MODEL, config.WHISPER_DEVICE,
+                    )
+                    self._whisper_model = WhisperModel(
+                        config.WHISPER_MODEL,
+                        device=config.WHISPER_DEVICE,
+                        compute_type=config.WHISPER_COMPUTE_TYPE,
+                    )
+                    log.info("Whisper model loaded.")
         return self._whisper_model
 
-    # ── Main clip pipeline ──────────────────────────────────────────────────
+    # ── Live clip pipeline ──────────────────────────────────────────────────
 
     def _make_clip(self, spike_time: float, recent_chat) -> None:
-        clip_id = int(spike_time)
-        log.info("=== Making clip %d ===", clip_id)
-
+        with self._stats_lock:
+            self._live_counter += 1
+            index = self._live_counter
+        clip_start = spike_time - config.CLIP_LOOKBACK
+        clip_end = clip_start + config.CLIP_DURATION
+        result = ClipResult(index=index, start=clip_start, end=clip_end,
+                            hype_time=spike_time, status="running")
+        log.info("=== Making live clip %d (spike at %.1f) ===", index, spike_time)
+        job_dir: Optional[Path] = None
         try:
-            # ── Step 1: gather segments ──────────────────────────────────
-            needed_seconds = config.CLIP_LOOKBACK + config.CLIP_DURATION + 5
-            get_window = getattr(self.recorder, "get_segments_for_window", None)
-            if get_window:
-                segments = get_window(spike_time, config.CLIP_DURATION)
-            else:
-                segments = self.recorder.get_segments_covering(needed_seconds)
-
+            segments = self._wait_for_live_window(clip_start, clip_end)
             if not segments:
-                log.warning("Clip %d: no segments available yet.", clip_id)
-                self.clips_failed += 1
-                return
+                raise ClipError("segments", "no recorded segments cover this moment.")
 
-            # ── Step 2: write concat list & extract raw clip ─────────────
-            concat_list = config.TMP_DIR / f"concat_{clip_id}.txt"
-            self._write_concat_list(concat_list, segments)
-
-            raw_clip = config.TMP_DIR / f"raw_{clip_id}.mp4"
-            if not self._extract_raw_clip(concat_list, raw_clip, segments, spike_time):
-                self.clips_failed += 1
-                return
-            raw_duration = _probe_media_duration(raw_clip)
-            if raw_duration + 2.0 < config.CLIP_DURATION:
-                log.error(
-                    "Clip %d extraction is only %.1f s; expected %d s. Skipping short output.",
-                    clip_id,
-                    raw_duration,
-                    config.CLIP_DURATION,
+            win_start = max(clip_start, segments[0].wall_start)
+            win_end = min(clip_end, segments[-1].wall_end)
+            duration = win_end - win_start
+            if duration < config.CLIP_MIN_DURATION:
+                raise ClipError(
+                    "segments",
+                    f"only {duration:.1f} s of footage recorded around the spike "
+                    f"(minimum {config.CLIP_MIN_DURATION} s).",
                 )
-                self.clips_failed += 1
-                return
 
-            # ── Step 3: generate title from chat ────────────────────────
-            title = generate_title(recent_chat)
-            log.info("Clip %d title: %r", clip_id, title)
-
-            # ── Step 4: transcribe with faster-whisper ───────────────────
-            srt_path = config.TMP_DIR / f"subs_{clip_id}.srt"
-            self._transcribe(raw_clip, srt_path)
-
-            # ── Step 5: encode final horizontal 16:9 clip ────────────────
-            safe_title = _safe_filename(title)
-            ts_str     = time.strftime("%Y%m%d_%H%M%S", time.localtime(spike_time))
-            job_suffix = uuid.uuid4().hex[:8]
-            out_path   = config.CLIPS_DIR / f"clip_{ts_str}_{safe_title}_{job_suffix}.mp4"
-
-            if not self._encode_final(raw_clip, srt_path, title, out_path):
-                self.clips_failed += 1
-                return
-
-            self.clips_made += 1
-            log.info("✅ Clip saved: %s", out_path)
-
-        except Exception as exc:
-            log.exception("Clip %d failed: %s", clip_id, exc)
-            self.clips_failed += 1
-        finally:
-            self._cleanup(clip_id)
-
-    # ── Step 2: concat & extract ────────────────────────────────────────────
-
-    def _write_concat_list(self, path: Path, segments: list[SegmentInfo]) -> None:
-        with path.open("w", encoding="utf-8") as f:
+            # Hard-link (or copy) the segments into the job dir so the
+            # recorder can prune its buffer while we encode.
+            job_dir = Path(tempfile.mkdtemp(prefix="live_", dir=config.TMP_DIR))
+            local_names = []
             for seg in segments:
-                # ffmpeg concat demuxer requires forward slashes
-                f.write(f"file '{seg.path.as_posix()}'\n")
-
-    def _extract_raw_clip(
-        self,
-        concat_list: Path,
-        out_path: Path,
-        segments: list[SegmentInfo],
-        spike_time: float,
-    ) -> bool:
-        """
-        Extracts CLIP_DURATION seconds starting CLIP_LOOKBACK seconds before
-        the spike from the concatenated segments.
-        """
-        if not segments:
-            return False
-
-        # Calculate how far from the START of our segment buffer the clip begins
-        earliest_wall = segments[0].wall_start
-        total_duration = sum(s.duration for s in segments)
-        if total_duration < config.CLIP_DURATION:
-            log.warning(
-                "Clip buffer is only %.1f s; waiting for at least %d s before making a clip.",
-                total_duration,
-                config.CLIP_DURATION,
+                local = job_dir / seg.path.name
+                try:
+                    os.link(seg.path, local)
+                except OSError:
+                    shutil.copy2(seg.path, local)
+                local_names.append(local.name)
+            concat_list = job_dir / "concat.txt"
+            concat_list.write_text(
+                "".join(f"file '{name}'\n" for name in local_names), encoding="utf-8"
             )
-            return False
-        clip_start_wall = spike_time - config.CLIP_LOOKBACK
 
-        # Offset from beginning of concat buffer
-        offset = max(0.0, clip_start_wall - earliest_wall)
-        # Don't overshoot the buffer
-        offset = min(offset, max(0.0, total_duration - config.CLIP_DURATION))
+            title = generate_title(recent_chat)
+            log.info("Clip %d title: %r", index, title)
+            ts_str = time.strftime("%Y%m%d_%H%M%S", time.localtime(spike_time))
+            out_path = config.CLIPS_DIR / (
+                f"clip_{ts_str}_{_safe_filename(title)}_{uuid.uuid4().hex[:8]}.mp4"
+            )
+            media = probe_media(job_dir / local_names[0])
+            result.path = self._render(
+                source=concat_list,
+                input_args=("-f", "concat", "-safe", "0"),
+                start=win_start - segments[0].wall_start,
+                duration=duration,
+                has_audio=bool(media and media.has_audio),
+                source_size=(media.width, media.height) if media else None,
+                title=title,
+                out_path=out_path,
+                result=result,
+            )
+            result.status = "ok"
+            self._count(ok=True)
+            log.info("✅ Clip saved: %s", result.path)
+        except ClipError as exc:
+            self._fail(result, exc, "live", None)
+        except Exception as exc:
+            log.exception("Clip %d failed: %s", index, exc)
+            self._fail(result, ClipError("internal", str(exc)), "live", None)
+        finally:
+            if job_dir:
+                shutil.rmtree(job_dir, ignore_errors=True)
 
-        log.debug(
-            "Extract: offset=%.1f s, duration=%d s from %d segments",
-            offset, config.CLIP_DURATION, len(segments),
-        )
+    def _wait_for_live_window(self, clip_start: float, clip_end: float) -> list[SegmentInfo]:
+        """
+        Wait until the recorder has *completed* footage up to clip_end (the
+        spike happens before most of the clip has been recorded), then
+        return the segments overlapping [clip_start, clip_end].
+        """
+        recorder = self.recorder
+        if recorder is None:
+            return []
+        get_between = getattr(recorder, "get_segments_between", None)
+        if get_between is None:
+            get_window = getattr(recorder, "get_segments_for_window", None)
+            if get_window:
+                return get_window(clip_start + config.CLIP_LOOKBACK, config.CLIP_DURATION)
+            return recorder.get_segments_covering(config.CLIP_LOOKBACK + config.CLIP_DURATION)
 
-        cmd = [
-            config.FFMPEG_BIN,
-            "-hide_banner", "-loglevel", "warning",
-            "-y",
-            "-f", "concat", "-safe", "0",
-            "-i", str(concat_list),
-            "-ss", f"{offset:.2f}",
-            "-t",  str(config.CLIP_DURATION),
-            "-c", "copy",
-            str(out_path),
-        ]
+        deadline = time.time() + max(0.0, clip_end - time.time()) + 2 * config.SEGMENT_DURATION + 30
+        while True:
+            latest = recorder.latest_segment()
+            if latest is not None and latest.wall_end >= clip_end:
+                break
+            if self._live_stop.is_set() or self._stop_event.is_set():
+                log.info("Stopping early; rendering the footage recorded so far.")
+                break
+            if time.time() > deadline:
+                log.warning("Timed out waiting for footage up to %.1f.", clip_end)
+                break
+            self._live_stop.wait(2.0)
+        return get_between(clip_start, clip_end)
 
+    # ── Shared render pipeline ──────────────────────────────────────────────
+
+    def _render(
+        self,
+        *,
+        source: Path,
+        input_args: Sequence[str],
+        start: float,
+        duration: float,
+        has_audio: bool,
+        title: str,
+        out_path: Path,
+        result: ClipResult,
+        progress: Optional[ProgressCallback] = None,
+        source_size: Optional[tuple[int, int]] = None,
+    ) -> Path:
+        _ensure_disk_space(config.CLIPS_DIR)
+        job_dir = Path(tempfile.mkdtemp(prefix=f"clip{result.index}_", dir=config.TMP_DIR))
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-            if result.returncode != 0:
-                log.error("ffmpeg extract failed:\n%s", result.stderr)
-                return False
-            if not out_path.exists() or out_path.stat().st_size < 1000:
-                log.error("ffmpeg extract produced empty file.")
-                return False
-            return True
-        except subprocess.TimeoutExpired:
-            log.error("ffmpeg extract timed out.")
+            srt_path = job_dir / "subs.srt"
+            _write_empty_srt(srt_path)
+            if self._captions and has_audio:
+                if progress:
+                    progress(result, "transcribing", 0.0)
+                wav = job_dir / "audio.wav"
+                if self._extract_audio(source, input_args, start, duration, wav):
+                    self._transcribe(wav, srt_path)
+
+            def _on_progress(fraction: float) -> None:
+                if progress:
+                    progress(result, "encoding", fraction)
+
+            self._encode_final(
+                source, srt_path, title, out_path,
+                input_args=input_args, start=start, duration=duration,
+                has_audio=has_audio, on_progress=_on_progress,
+                source_size=source_size,
+            )
+            return out_path
+        finally:
+            shutil.rmtree(job_dir, ignore_errors=True)
+
+    def _extract_audio(
+        self, source: Path, input_args: Sequence[str], start: float, duration: float, wav: Path
+    ) -> bool:
+        cmd = [
+            config.FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-y",
+            *input_args, "-ss", f"{start:.3f}", "-t", f"{duration:.3f}", "-i", str(source),
+            "-vn", "-ac", "1", "-ar", "16000", str(wav),
+        ]
+        res = run_ffmpeg(cmd, timeout=max(120, duration * 2), cancel_event=self._stop_event)
+        if res.returncode != 0 or not wav.exists():
+            log.warning("Audio extraction for captions failed (exit %s): %s",
+                        res.returncode, res.last_error_line())
             return False
+        return True
 
-    # ── Step 4: transcription ───────────────────────────────────────────────
-
-    def _transcribe(self, video_path: Path, srt_path: Path) -> None:
-        """
-        Run faster-whisper on the raw clip and write an SRT file.
-        Falls back to an empty SRT if anything fails.
-        """
+    def _transcribe(self, audio_path: Path, srt_path: Path) -> None:
+        """Run faster-whisper and write an SRT file (empty on failure)."""
         try:
             model = self._get_whisper_model()
-        except Exception:
-            _write_empty_srt(srt_path)
-            return
-
-        try:
             with self._whisper_lock:
                 segments, _info = model.transcribe(
-                    str(video_path),
+                    str(audio_path),
                     language=config.WHISPER_LANGUAGE,
                     vad_filter=True,
                     word_timestamps=False,
                     beam_size=5,
                 )
                 seg_list = list(segments)   # consume generator while lock held
-
             _write_srt(seg_list, srt_path)
             log.info("Transcribed %d segments to %s.", len(seg_list), srt_path.name)
-
         except Exception as exc:
-            log.warning("Transcription failed: %s. Writing empty SRT.", exc)
+            log.warning("Transcription failed: %s. Clip will have no captions.", exc)
             _write_empty_srt(srt_path)
-
-    # ── Step 5: final encode ────────────────────────────────────────────────
 
     def _encode_final(
         self,
@@ -283,293 +462,296 @@ class ClipMaker:
         title: str,
         out_path: Path,
         cam_clip: Optional[Path] = None,
+        *,
+        input_args: Sequence[str] = (),
+        start: float = 0.0,
+        duration: Optional[float] = None,
+        has_audio: bool = True,
+        on_progress: Optional[Callable[[float], None]] = None,
+        source_size: Optional[tuple[int, int]] = None,
     ) -> bool:
         """
-        Single ffmpeg pass producing a 16:9 horizontal clip (1920×1080):
+        Single ffmpeg pass producing a verified 16:9 1920×1080 H.264/AAC MP4.
 
-        Layout (no cam):
-          • Probe source dimensions.
-          • If fill_mode="blur": [0:v] scaled + blurred background, then source
-            scaled-to-fit centered on top → 1920×1080.
-          • If fill_mode="black": scale with pad to 1920×1080 (black bars).
+        `raw_clip` is the input (a media file or a concat list when
+        input_args selects the concat demuxer); `start`/`duration` select
+        the range using accurate input seeking. Subtitle and title files
+        are referenced relative to their job directory (ffmpeg runs there),
+        so no filtergraph path/text escaping is needed.
 
-        Layout (with cam overlay):
-          • Same background as above.
-          • Streamer cam composited bottom-right, proportional to output width.
-
-        Then:
-          • Burn SRT subtitles.
-          • Draw title text at top.
-          • Encode H.264 / AAC.
+        Returns True on success; raises ClipError otherwise.
         """
         w, h = config.OUTPUT_WIDTH, config.OUTPUT_HEIGHT
+        work_dir = srt_path.parent
+        if duration is None:
+            media = probe_media(raw_clip)
+            duration = max(0.0, (media.duration if media else 0.0) - start)
+        if duration <= 0:
+            raise ClipError("validate", "clip duration must be greater than zero.")
 
-        # ── Probe source video dimensions ─────────────────────────────────
-        src_w, src_h = _probe_video_dimensions(raw_clip)
-        if src_w <= 0 or src_h <= 0:
-            # Fallback: assume 16:9
-            src_w, src_h = 1920, 1080
-            log.warning("Could not probe source dimensions; assuming 1920×1080.")
-
-        # ── Build video filter chain ───────────────────────────────────────
-        fill_mode = config.OUTPUT_FILL_MODE.lower()
-        inputs = ["-i", str(raw_clip)]
-        if (
+        has_cam = bool(
             config.INCLUDE_STREAMER_CAM.lower() != "off"
-            and cam_clip
-            and cam_clip.exists()
-            and cam_clip.stat().st_size > 1000
-        ):
-            inputs += ["-i", str(cam_clip)]
-            has_cam = True
-        else:
-            has_cam = False
+            and cam_clip and cam_clip.exists() and cam_clip.stat().st_size > 1000
+        )
 
-        if fill_mode == "blur":
-            # Background: scale source to fill 1920×1080 (may crop edges), blur it
-            bg = (
-                f"[0:v]scale={w}:{h}:force_original_aspect_ratio=increase,"
-                f"crop={w}:{h},"
-                f"boxblur=20:5[bg]"
-            )
-            # Foreground: scale source to fit inside 1920×1080 (letterbox / pillarbox)
-            fg = (
-                f"[0:v]scale={w}:{h}:force_original_aspect_ratio=decrease[fg]"
-            )
-            # Overlay fg centered over bg
-            overlay_base = (
-                f"[bg][fg]overlay=(W-w)/2:(H-h)/2[base]"
-            )
+        # ── Background / fit ──────────────────────────────────────────────
+        if source_size is None:
+            source_size = _probe_video_dimensions(raw_clip)
+        src_w, src_h = source_size
+        same_aspect = src_w > 0 and src_h > 0 and abs(src_w / src_h - w / h) < 0.01
+        if same_aspect:
+            # Already 16:9 — the background would be fully covered anyway.
+            filter_parts = [f"[0:v]scale={w}:{h}[base]"]
+        elif config.OUTPUT_FILL_MODE.lower() == "blur":
+            # Blur at quarter resolution (~20× faster, visually identical).
+            bw, bh = max(2, w // 4 // 2 * 2), max(2, h // 4 // 2 * 2)
+            filter_parts = [
+                f"[0:v]split=2[bgsrc][fgsrc]",
+                f"[bgsrc]scale={bw}:{bh}:force_original_aspect_ratio=increase,"
+                f"crop={bw}:{bh},boxblur=5:2,scale={w}:{h}[bg]",
+                f"[fgsrc]scale={w}:{h}:force_original_aspect_ratio=decrease[fg]",
+                "[bg][fg]overlay=(W-w)/2:(H-h)/2[base]",
+            ]
         else:
-            # Black bars
-            bg = ""
-            fg = ""
-            overlay_base = (
+            filter_parts = [
                 f"[0:v]scale={w}:{h}:force_original_aspect_ratio=decrease,"
                 f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black[base]"
-            )
+            ]
+        final_label = "base"
 
-        # ── Cam overlay (bottom-right) ────────────────────────────────────
         if has_cam:
             cam_w = int(w * config.CAM_OVERLAY_WIDTH_FRAC)
-            # Maintain cam aspect ratio by scaling width, height auto
-            cam_scale = f"[1:v]scale={cam_w}:-1[cam]"
-            margin    = config.CAM_OVERLAY_MARGIN
-            cam_x     = f"W-w-{margin}"
-            cam_y     = f"H-h-{margin}"
-            cam_composite = f"[base][cam]overlay={cam_x}:{cam_y}[composited]"
-            final_label   = "composited"
-        else:
-            cam_scale     = ""
-            cam_composite = ""
-            final_label   = "base"
+            margin = config.CAM_OVERLAY_MARGIN
+            filter_parts.append(f"[1:v]scale={cam_w}:-2[cam]")
+            filter_parts.append(f"[base][cam]overlay=W-w-{margin}:H-h-{margin}[composited]")
+            final_label = "composited"
 
-        # ── Subtitle filter ───────────────────────────────────────────────
-        srt_escaped = _escape_ffmpeg_path(str(srt_path))
-        has_subs    = srt_path.exists() and srt_path.stat().st_size > 10
-        sub_filter  = ""
-        if has_subs:
-            sub_filter = (
-                f"subtitles='{srt_escaped}'"
+        # ── Captions + title ──────────────────────────────────────────────
+        video_filters = []
+        if srt_path.exists() and srt_path.stat().st_size > 10:
+            video_filters.append(
+                f"subtitles={srt_path.name}"
                 f":force_style='FontSize={config.CAPTION_FONT_SIZE},"
-                f"PrimaryColour=&Hffffff,"
-                f"OutlineColour=&H000000,"
-                f"BorderStyle=3,"
-                f"Outline=2,"
-                f"Alignment=2'"
+                f"PrimaryColour=&Hffffff,OutlineColour=&H000000,"
+                f"BorderStyle=3,Outline=2,Alignment=2'"
             )
-
-        # ── Title drawtext ────────────────────────────────────────────────
-        title_escaped = title.replace("'", "\\'").replace(":", "\\:")[:config.TITLE_MAX_CHARS]
-        title_filter  = (
-            f"drawtext=text='{title_escaped}'"
-            f":fontsize={config.TITLE_FONT_SIZE}"
-            f":fontcolor={config.TITLE_FONT_COLOR}"
-            f":box=1:boxcolor={config.TITLE_BG_COLOR}"
-            f":boxborderw={config.CAPTION_BOX_BORDER}"
-            f":x=(w-text_w)/2"
-            f":y=40"
-        )
-
-        # ── Assemble filtergraph ──────────────────────────────────────────
-        if fill_mode == "blur":
-            filter_parts = [bg, fg, overlay_base]
-        else:
-            filter_parts = [overlay_base]
-        filter_parts.extend(part for part in (cam_scale, cam_composite) if part)
-        video_filters = [part for part in (sub_filter, title_filter) if part]
-        filter_parts.append(f"[{final_label}]{','.join(video_filters)}")
+        title = (title or "").strip()[: config.TITLE_MAX_CHARS]
+        if title:
+            title_file = work_dir / f"title_{uuid.uuid4().hex[:6]}.txt"
+            title_file.write_text(title, encoding="utf-8")
+            video_filters.append(
+                f"drawtext=textfile={title_file.name}:expansion=none"
+                f":fontsize={config.TITLE_FONT_SIZE}"
+                f":fontcolor={config.TITLE_FONT_COLOR}"
+                f":box=1:boxcolor={config.TITLE_BG_COLOR}"
+                f":boxborderw={config.CAPTION_BOX_BORDER}"
+                f":x=(w-text_w)/2:y=40"
+            )
+        video_filters.append("format=yuv420p")   # 10-bit/HDR sources → widely playable
+        filter_parts.append(f"[{final_label}]{','.join(video_filters)}[vout]")
         filtergraph = ";".join(filter_parts)
 
-        # A long CPU encode can take several minutes, especially when other
-        # clipping processes are running.
-        encode_timeout = max(900, config.CLIP_DURATION * 10)
-        temp_out = out_path.with_name(
-            f".{out_path.stem}.{uuid.uuid4().hex[:8]}.partial.mp4"
-        )
-
+        temp_out = out_path.with_name(f".{out_path.stem}.{uuid.uuid4().hex[:8]}.partial.mp4")
+        seek = ["-ss", f"{start:.3f}"] if start > 0 else []
         cmd = [
-            config.FFMPEG_BIN,
-            "-hide_banner", "-loglevel", "warning",
-            "-y",
+            config.FFMPEG_BIN, "-hide_banner", "-loglevel", "warning", "-y",
+            *input_args, *seek, "-t", f"{duration:.3f}", "-i", str(raw_clip),
         ]
-        cmd += inputs
+        if has_cam:
+            cmd += [*seek, "-t", f"{duration:.3f}", "-i", str(cam_clip)]
+        cmd += ["-filter_complex", filtergraph, "-map", "[vout]"]
+        if has_audio:
+            cmd += [
+                "-map", "0:a:0",
+                "-af", "aresample=async=1:first_pts=0",
+                "-c:a", "aac", "-b:a", "128k", "-ac", "2", "-ar", "48000",
+            ]
+        else:
+            cmd += ["-an"]
         cmd += [
-            "-filter_complex", filtergraph,
-            "-c:v", "libx264",
-            "-preset", "fast",
-            "-crf", "23",
-            "-c:a", "aac",
-            "-b:a", "128k",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-pix_fmt", "yuv420p",
+            "-max_muxing_queue_size", "4096",
             "-movflags", "+faststart",
             str(temp_out),
         ]
 
+        # Long CPU encodes can take several minutes, especially in parallel.
+        encode_timeout = max(900, duration * 10)
         log.debug("ffmpeg filtergraph: %s", filtergraph)
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=encode_timeout)
-            if result.returncode != 0:
-                log.error("ffmpeg final encode failed:\n%s", result.stderr[-2000:])
-                return False
-            if not self._validate_encoded_clip(temp_out):
-                log.error("ffmpeg output is incomplete or invalid; not saving %s.", out_path.name)
-                return False
-            os.replace(temp_out, out_path)
-            return True
-        except subprocess.TimeoutExpired:
-            log.error(
-                "ffmpeg final encode timed out after %d s; incomplete output discarded.",
-                encode_timeout,
+            res = run_ffmpeg(
+                cmd,
+                timeout=encode_timeout,
+                expected_duration=duration,
+                on_progress=on_progress,
+                cancel_event=self._stop_event,
+                cwd=work_dir,
             )
-            return False
-        except OSError:
-            log.exception("Could not publish encoded clip %s.", out_path)
-            return False
+            if res.cancelled:
+                raise ClipError("cancelled", "the job was cancelled.")
+            if res.timed_out:
+                raise ClipError(
+                    "timeout",
+                    f"ffmpeg did not finish within {encode_timeout:.0f} s.",
+                    f"command: {format_cmd(cmd)}",
+                )
+            if res.returncode != 0:
+                raise ClipError(
+                    "encode",
+                    f"exit code {res.signed_returncode}: {res.last_error_line() or 'no error output'}",
+                    f"command: {format_cmd(cmd)}\nstderr:\n{res.stderr[-3000:]}",
+                )
+            reason = self._verify_output(temp_out, duration, has_audio)
+            if reason:
+                raise ClipError("verify", reason, f"file: {temp_out}")
+            try:
+                os.replace(temp_out, out_path)
+            except OSError as exc:
+                raise ClipError("publish", str(exc)) from None
+            return True
         finally:
             try:
                 temp_out.unlink(missing_ok=True)
             except OSError:
                 log.warning("Could not remove incomplete encode %s.", temp_out)
 
-    def _validate_encoded_clip(self, path: Path) -> bool:
-        """Check that ffmpeg produced a playable, full-duration H.264 MP4."""
+    # ── Output verification ────────────────────────────────────────────────
+
+    def _verify_output(
+        self, path: Path, expected_duration: Optional[float] = None, expect_audio: bool = False
+    ) -> Optional[str]:
+        """Return None if `path` is a playable MP4, else a reason string."""
         if not path.exists() or path.stat().st_size < 1000:
-            log.error("Encoded output is missing or too small: %s", path)
-            return False
+            return "output file is missing or empty."
 
         cmd = [
-            config.FFPROBE_BIN,
-            "-v", "error",
+            config.FFPROBE_BIN, "-v", "error",
             "-show_entries", "format=format_name,duration",
             "-show_entries", "stream=codec_type,codec_name",
-            "-of", "json",
-            str(path),
+            "-of", "json", str(path),
         ]
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         except FileNotFoundError:
-            log.error("ffprobe not found; cannot validate encoded clip.")
-            return False
+            return "ffprobe not found; cannot validate output."
         except subprocess.TimeoutExpired:
-            log.error("Timed out validating encoded clip %s.", path)
-            return False
-
+            return "timed out inspecting the output."
         if result.returncode != 0:
-            log.error("ffprobe rejected encoded clip %s: %s", path, result.stderr.strip())
-            return False
+            return f"ffprobe could not read the output ({result.stderr.strip()[-300:]})."
         try:
             metadata = json.loads(result.stdout)
             duration = float(metadata["format"]["duration"])
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-            log.error("ffprobe returned invalid clip metadata for %s.", path)
-            return False
+            return "ffprobe returned invalid metadata."
 
-        format_name = metadata.get("format", {}).get("format_name", "")
         streams = metadata.get("streams", [])
-        has_h264_video = any(
-            stream.get("codec_type") == "video"
-            and stream.get("codec_name") == "h264"
-            for stream in streams
-        )
-        if (
-            "mp4" not in format_name.split(",")
-            or not has_h264_video
-            or duration < config.CLIP_DURATION - 2
-        ):
-            log.error(
-                "Encoded clip validation failed: format=%s, h264_video=%s, duration=%.1f s.",
-                format_name,
-                has_h264_video,
-                duration,
+        if "mp4" not in metadata.get("format", {}).get("format_name", "").split(","):
+            return "output is not an MP4 file."
+        if not any(s.get("codec_type") == "video" and s.get("codec_name") == "h264" for s in streams):
+            return "output has no H.264 video stream."
+        if expect_audio and not any(s.get("codec_type") == "audio" for s in streams):
+            return "output has no audio stream."
+        if expected_duration and abs(duration - expected_duration) > config.CLIP_DURATION_TOLERANCE:
+            return (
+                f"output is {duration:.1f} s long but {expected_duration:.1f} s was requested "
+                "(source may be truncated)."
             )
-            return False
-        return True
 
-    # ── Cleanup ─────────────────────────────────────────────────────────────
+        # Full decode test: catches corrupt frames that ffprobe accepts.
+        decode = [config.FFMPEG_BIN, "-v", "error", "-xerror", "-i", str(path), "-f", "null", "-"]
+        try:
+            dres = subprocess.run(
+                decode, capture_output=True, text=True,
+                timeout=max(120, (expected_duration or duration) * 3),
+            )
+        except subprocess.TimeoutExpired:
+            return "timed out while test-decoding the output."
+        if dres.returncode != 0:
+            return f"output could not be decoded: {dres.stderr.strip()[-300:]}"
+        return None
 
-    def _cleanup(self, clip_id: int) -> None:
-        for pattern in (f"raw_{clip_id}.mp4", f"subs_{clip_id}.srt",
-                        f"concat_{clip_id}.txt"):
-            try:
-                (config.TMP_DIR / pattern).unlink(missing_ok=True)
-            except Exception:
-                pass
+    def _validate_encoded_clip(
+        self, path: Path, expected_duration: Optional[float] = None, expect_audio: bool = False
+    ) -> bool:
+        reason = self._verify_output(path, expected_duration, expect_audio)
+        if reason:
+            log.error("Encoded clip validation failed for %s: %s", path, reason)
+        return reason is None
+
+    # ── Helpers ─────────────────────────────────────────────────────────────
+
+    def _source_media(self, source: Path) -> MediaInfo:
+        with self._media_lock:
+            cached = self._media_cache.get(source)
+        if cached:
+            return cached
+        if not source.exists():
+            raise ClipError("source", f"file not found: {source}")
+        media = probe_media(source)
+        if media is None:
+            raise ClipError("source", f"ffprobe could not read {source.name}.")
+        if not media.has_video:
+            raise ClipError("streams", "no video stream found in the source.")
+        if media.duration <= 0:
+            raise ClipError("source", "could not determine the source duration.")
+        if not media.has_audio:
+            log.warning("Source %s has no audio stream; clips will be silent.", source.name)
+        with self._media_lock:
+            self._media_cache[source] = media
+        return media
+
+    def _count(self, ok: bool) -> None:
+        with self._stats_lock:
+            if ok:
+                self.clips_made += 1
+            else:
+                self.clips_failed += 1
+
+    def _fail(
+        self, result: ClipResult, exc: ClipError, video_label: str, media: Optional[MediaInfo]
+    ) -> None:
+        result.status = "failed"
+        result.stage = exc.stage
+        result.error = exc.user_message()
+        result.path = None
+        self._count(ok=False)
+        log.error(
+            "❌ Clip %d failed at stage '%s': %s | video=%s | video_duration=%s | "
+            "hype_time=%s | requested=%s-%s",
+            result.index, exc.stage, exc.message, video_label or "?",
+            f"{media.duration:.2f}s" if media else "?",
+            f"{result.hype_time:.2f}s" if result.hype_time is not None else "n/a",
+            f"{result.start:.3f}", f"{result.end:.3f}",
+        )
+        if exc.detail:
+            log.error("Clip %d failure details:\n%s", result.index, exc.detail)
 
 
 # ---------------------------------------------------------------------------
-# Video dimension probe helper
+# Probe helpers (kept for backwards compatibility)
 # ---------------------------------------------------------------------------
 
 def _probe_video_dimensions(video_path: Path) -> tuple[int, int]:
-    """
-    Use ffprobe to get the (width, height) of the first video stream.
-    Returns (0, 0) on failure.
-    """
-    cmd = [
-        config.FFPROBE_BIN,
-        "-v", "error",
-        "-select_streams", "v:0",
-        "-show_entries", "stream=width,height",
-        "-of", "csv=p=0",
-        str(video_path),
-    ]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-        if result.returncode == 0:
-            line = result.stdout.strip().splitlines()[0] if result.stdout.strip() else ""
-            parts = line.split(",")
-            if len(parts) >= 2:
-                return int(parts[0]), int(parts[1])
-    except Exception as exc:
-        log.debug("_probe_video_dimensions failed: %s", exc)
-    return 0, 0
+    media = probe_media(video_path)
+    return (media.width, media.height) if media else (0, 0)
 
 
 def _probe_media_duration(video_path: Path) -> float:
-    """Return media duration in seconds, or zero when ffprobe cannot read it."""
-    cmd = [
-        config.FFPROBE_BIN,
-        "-v", "error",
-        "-show_entries", "format=duration",
-        "-of", "csv=p=0",
-        str(video_path),
-    ]
+    media = probe_media(video_path)
+    return media.duration if media else 0.0
+
+
+def _ensure_disk_space(directory: Path) -> None:
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-    except FileNotFoundError:
-        log.error("ffprobe not found while validating extracted clip duration.")
-        return 0.0
-    except subprocess.TimeoutExpired:
-        log.error("ffprobe timed out while validating %s.", video_path)
-        return 0.0
-    if result.returncode != 0:
-        log.error("ffprobe could not read extracted clip duration: %s", result.stderr.strip())
-        return 0.0
-    try:
-        return float(result.stdout.strip())
-    except ValueError:
-        log.error("ffprobe returned an invalid duration for %s.", video_path)
-        return 0.0
+        free_mb = shutil.disk_usage(directory).free / (1024 * 1024)
+    except OSError:
+        return
+    if free_mb < config.MIN_FREE_DISK_MB:
+        raise ClipError(
+            "disk",
+            f"only {free_mb:.0f} MB free in {directory} (need {config.MIN_FREE_DISK_MB} MB).",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -606,14 +788,3 @@ def _safe_filename(text: str) -> str:
     safe = re.sub(r"[^\w\s\-]", "", text)
     safe = re.sub(r"\s+", "_", safe.strip())
     return safe[:40] or "clip"
-
-
-def _escape_ffmpeg_path(path_str: str) -> str:
-    """
-    Escape a path for use inside an ffmpeg -vf filter value.
-    On Windows: forward-slash, escape colons after drive letter.
-    """
-    path_str = path_str.replace("\\", "/")
-    # Escape the colon in Windows drive letters (C:/ → C\\:/)
-    path_str = re.sub(r"^([A-Za-z]):/", r"\1\\:/", path_str)
-    return path_str

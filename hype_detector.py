@@ -54,6 +54,7 @@ class HypeDetector:
         self._loudness_history: deque[float] = deque(maxlen=config.ROLLING_WINDOW_SIZE)
 
         self._last_clip_time: float = 0.0
+        self._last_measured_segment = None   # segment behind last_rms_db
         self._stop_event = threading.Event()
         self._timer: Optional[threading.Timer] = None
 
@@ -140,6 +141,10 @@ class HypeDetector:
         )
 
         if chat_spiked or rms_spiked:
+            if rms_spiked and not chat_spiked and self._last_measured_segment is not None:
+                # The loud audio is in the measured segment, not at "now".
+                seg = self._last_measured_segment
+                spike_time = seg.wall_start + seg.duration / 2
             # 5. Cooldown check
             since_last = spike_time - self._last_clip_time
             if since_last >= config.CLIP_COOLDOWN_SECONDS:
@@ -174,8 +179,10 @@ class HypeDetector:
         Returns the RMS dB level, or -99.0 on failure.
         """
         seg = self.recorder.latest_segment()
+        self._last_measured_segment = None
         if seg is None or not seg.path.exists():
             return -99.0
+        self._last_measured_segment = seg
 
         cmd = [
             config.FFPROBE_BIN,

@@ -120,6 +120,18 @@ class StreamRecorder:
         with self._lock:
             return self._segments[-1] if self._segments else None
 
+    def get_segments_between(self, start: float, end: float) -> list[SegmentInfo]:
+        """Return the contiguous completed segments overlapping [start, end]."""
+        with self._lock:
+            segs = [s for s in self._segments if s.wall_end > start and s.wall_start < end]
+        # Keep only the last contiguous run so the concat timeline has no gaps.
+        run: list[SegmentInfo] = []
+        for seg in segs:
+            if run and seg.index != run[-1].index + 1:
+                run = []
+            run.append(seg)
+        return run
+
     def segment_count(self) -> int:
         with self._lock:
             return len(self._segments)
@@ -129,9 +141,7 @@ class StreamRecorder:
     def _resolve_stream_url(self) -> Optional[list[str]]:
         """Use yt-dlp to get the direct video and optional audio stream URLs."""
         log.info("Resolving stream URL via yt-dlp…")
-        cmd = [config.YTDLP_BIN]
-        if "youtube.com" in self.stream_url.lower() or "youtu.be" in self.stream_url.lower():
-            cmd.extend(["--js-runtimes", "deno"])
+        cmd = [config.YTDLP_BIN, *config.ytdlp_js_runtime_args(self.stream_url)]
         cmd.extend([
             "--get-url",
             "-f", config.STREAM_QUALITY,
@@ -240,7 +250,8 @@ class StreamRecorder:
                     continue
 
                 if idx not in seen:
-                    seen[idx] = time.time() - config.SEGMENT_DURATION
+                    # ffmpeg creates the file when the segment *starts*.
+                    seen[idx] = time.time()
                     log.debug("New segment detected: %s", f.name)
 
             # A segment is "complete" once the next one has appeared
@@ -254,12 +265,20 @@ class StreamRecorder:
                 if idx not in [s.index for s in self._segments]:
                     path = config.TMP_DIR / f"{self._segment_prefix}_{idx:05d}.ts"
                     if path.exists():
-                        wall_start = seen[idx]
+                        with self._lock:
+                            prev = self._segments[-1] if self._segments else None
+                        # Chain contiguous segments so the wall-clock timeline
+                        # matches the media timeline used when cutting clips.
+                        if prev is not None and prev.index == idx - 1:
+                            wall_start = prev.wall_end
+                        else:
+                            wall_start = seen[idx]
+                        duration = _probe_segment_duration(path)
                         seg = SegmentInfo(
                             path=path,
                             index=idx,
                             wall_start=wall_start,
-                            duration=float(config.SEGMENT_DURATION),
+                            duration=duration,
                         )
                         with self._lock:
                             self._segments.append(seg)
@@ -274,3 +293,13 @@ class StreamRecorder:
                             "Registered segment #%05d (wall %.1f)",
                             idx, wall_start,
                         )
+
+
+def _probe_segment_duration(path: Path) -> float:
+    """Actual duration of a sealed segment (segments are cut on keyframes,
+    so they are rarely exactly SEGMENT_DURATION long)."""
+    from media_tools import probe_media
+    media = probe_media(path, timeout=10)
+    if media and media.duration > 0:
+        return media.duration
+    return float(config.SEGMENT_DURATION)
